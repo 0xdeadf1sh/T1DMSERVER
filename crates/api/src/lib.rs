@@ -1,0 +1,81 @@
+//! t1dm-api — the axum HTTP/WS surface. `build_router` wires every route to
+//! a handler; auth is enforced per-route by the [`auth::Auth`] /
+//! [`auth::RwAuth`] extractors. The server is driven by tokio in the root
+//! binary.
+
+pub mod auth;
+pub mod error;
+pub mod handlers;
+pub mod hub;
+pub(crate) mod util;
+
+#[cfg(test)]
+mod tests;
+
+pub use error::{ApiError, ApiResult};
+pub use hub::{Event, HubMsg, WsHub};
+
+use std::net::SocketAddr;
+
+use axum::routing::{get, post, put};
+use axum::Router;
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
+
+use store::Store;
+
+/// Shared application state handed to every handler.
+#[derive(Clone)]
+pub struct AppState {
+    pub store: Store,
+    pub hub: WsHub,
+}
+
+/// Build the complete `/v1` router. The returned [`Router`] already carries
+/// its state and is ready to hand to `axum::serve`.
+pub fn build_router(store: Store, hub: WsHub) -> Router {
+    let state = AppState { store, hub };
+
+    let v1 = Router::new()
+        .route("/ingest", post(handlers::ingest))
+        .route("/series/{name}", put(handlers::put_series))
+        .route("/series", get(handlers::get_series))
+        .route(
+            "/predictions",
+            put(handlers::put_predictions).get(handlers::get_predictions),
+        )
+        .route("/predictions/latest", get(handlers::get_prediction_latest))
+        .route("/notes", post(handlers::post_note).get(handlers::get_notes))
+        .route(
+            "/photos",
+            post(handlers::post_photo).get(handlers::get_photos),
+        )
+        .route("/photos/{id}", get(handlers::get_photo_binary))
+        .route(
+            "/alerts",
+            post(handlers::post_alert).get(handlers::get_alerts),
+        )
+        .route("/models", get(handlers::get_models))
+        .route("/models/{id}/meta", get(handlers::get_model_meta))
+        .route("/models/{id}/download", get(handlers::get_model_file))
+        .route("/stats", get(handlers::get_stats))
+        .route("/health", get(handlers::get_health))
+        .route("/stream", get(handlers::ws_stream));
+
+    Router::new()
+        .nest("/v1", v1)
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
+/// Bind `addr` and serve `router`, threading per-connection socket info so
+/// the auth middleware can record client IPs. Blocks until the server stops.
+pub async fn serve(router: Router, addr: &str) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+}

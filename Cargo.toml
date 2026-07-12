@@ -1,0 +1,29 @@
+[package]
+name = "t1dmserver"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+
+[[bin]]
+name = "t1dmserver"
+path = "src/main.rs"
+
+[workspace]
+members = ["crates/core", "crates/store", "crates/api", "crates/tui"]
+
+[dependencies]
+t1dm_core = { path = "crates/core", package = "t1dm-core" }
+store = { path = "crates/store", package = "t1dm-store" }
+api = { path = "crates/api", package = "t1dm-api" }
+tui = { path = "crates/tui", package = "t1dm-tui" }
+tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+toml = "1.1.2"
+serde = { version = "1.0.228", features = ["derive"] }
+anyhow = "1.0.103"
+notify = "8.2.0"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"

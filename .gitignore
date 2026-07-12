@@ -1,0 +1,10 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+/data
+/photos
+/arch_logs
+config.toml
+/models/*
+!/models/.gitkeep
