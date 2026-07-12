@@ -89,6 +89,20 @@ dispatches the handler. Sessions persist across WebSocket reconnects.
 Every `/v1` endpoint requires a valid bearer token — `GET /v1/health` included. There is no
 unauthenticated route.
 
+### Login QR payload
+
+The Sessions pane renders a login QR encoding a single JSON object:
+
+```json
+{ "type": "t1dm-login", "token": "<secret>", "addr": "100.64.0.1", "port": 8443 }
+```
+
+- `type` — the constant tag `t1dm-login`.
+- `token` — the bearer secret (the same value used for `Authorization: Bearer` and `?token=`).
+- `addr` / `port` — the operator-configured advertised endpoint (`[qr]` in `config.toml`, typically the
+  Tailscale address). A client composes its base URL as `http://addr:port` (transport TLS is moot on the
+  tailnet). Minting a fresh `rw` token revokes the prior one, so an older QR's `token` stops working.
+
 ## Errors
 
 Errors return the mapped HTTP status with a JSON body:
