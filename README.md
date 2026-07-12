@@ -48,9 +48,9 @@ the TUI and handed to a phone by scanning a QR code.
 - **Model registry.** The models directory is scanned at startup and watched
   for changes; each artifact's opaque metadata and its bytes (with a SHA-256
   header) are served over HTTP.
-- **Themed terminal UI.** Three complete themes — Tron Legacy, Umbrella Corp,
-  and Hello Kitty — each with its own palette, animation vocabulary, boot
-  sequence, and glyph set, hot-swappable at runtime. Rendering is
+- **Themed terminal UI.** Four complete themes — Tron Legacy, Umbrella Corp,
+  Hello Kitty, and Windows XP — each with its own palette, animation vocabulary,
+  boot sequence, and glyph set, hot-swappable at runtime. Rendering is
   demand-driven: the UI idles near zero cost and wakes on input, a data event,
   or a live animation. Layout reflows responsively from a wide multi-panel view
   down to a single-column mobile layout for Termux.
@@ -167,7 +167,7 @@ sensible defaults; an absent file yields a fully-defaulted configuration.
 | `storage.data_dir` | `"./data"` | Root holding `t1dm.db`, `models/`, `photos/`, `backups/` |
 | `qr.advertise_addr` | `"100.64.0.1"` | Address embedded in the login QR payload |
 | `qr.advertise_port` | `8443` | Port embedded in the login QR payload |
-| `ui.theme` | `"tron"` | Active theme: `tron`, `umbrella`, or `hellokitty` |
+| `ui.theme` | `"tron"` | Active theme: `tron`, `umbrella`, `hellokitty`, or `winxp` |
 | `ui.fps` | `60` | Frame-rate ceiling (a cap, not a target) |
 | `ui.show_boot` | `true` | Play the theme boot sequence on launch |
 | `ui.bg_unit` | `"mgdl"` | Blood-glucose display unit: `mgdl` or `mmol` |

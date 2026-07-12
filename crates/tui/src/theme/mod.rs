@@ -6,6 +6,7 @@
 pub mod hellokitty;
 pub mod tron;
 pub mod umbrella;
+pub mod winxp;
 
 use std::time::Duration;
 
@@ -21,10 +22,16 @@ pub enum ThemeKind {
     Tron,
     Umbrella,
     HelloKitty,
+    WinXp,
 }
 
 impl ThemeKind {
-    pub const ALL: [ThemeKind; 3] = [ThemeKind::Tron, ThemeKind::Umbrella, ThemeKind::HelloKitty];
+    pub const ALL: [ThemeKind; 4] = [
+        ThemeKind::Tron,
+        ThemeKind::Umbrella,
+        ThemeKind::HelloKitty,
+        ThemeKind::WinXp,
+    ];
 
     /// Config string identifier.
     pub fn as_str(self) -> &'static str {
@@ -32,6 +39,7 @@ impl ThemeKind {
             ThemeKind::Tron => "tron",
             ThemeKind::Umbrella => "umbrella",
             ThemeKind::HelloKitty => "hellokitty",
+            ThemeKind::WinXp => "winxp",
         }
     }
 
@@ -40,6 +48,7 @@ impl ThemeKind {
         match s.to_ascii_lowercase().as_str() {
             "umbrella" | "umbrella_corp" | "umbrella-corp" => ThemeKind::Umbrella,
             "hellokitty" | "hello_kitty" | "hello-kitty" => ThemeKind::HelloKitty,
+            "winxp" | "xp" | "windowsxp" | "windows-xp" | "windows_xp" => ThemeKind::WinXp,
             _ => ThemeKind::Tron,
         }
     }
@@ -49,7 +58,8 @@ impl ThemeKind {
         match self {
             ThemeKind::Tron => ThemeKind::Umbrella,
             ThemeKind::Umbrella => ThemeKind::HelloKitty,
-            ThemeKind::HelloKitty => ThemeKind::Tron,
+            ThemeKind::HelloKitty => ThemeKind::WinXp,
+            ThemeKind::WinXp => ThemeKind::Tron,
         }
     }
 }
@@ -205,5 +215,63 @@ pub fn theme_for(kind: ThemeKind) -> Box<dyn Theme> {
         ThemeKind::Tron => Box::new(tron::Tron::default()),
         ThemeKind::Umbrella => Box::new(umbrella::Umbrella::default()),
         ThemeKind::HelloKitty => Box::new(hellokitty::HelloKitty::default()),
+        ThemeKind::WinXp => Box::new(winxp::WinXp::default()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    #[test]
+    fn kind_string_roundtrip_and_parsing() {
+        for k in ThemeKind::ALL {
+            assert_eq!(ThemeKind::from_str_or_default(k.as_str()), k);
+        }
+        assert_eq!(ThemeKind::from_str_or_default("winxp"), ThemeKind::WinXp);
+        assert_eq!(ThemeKind::from_str_or_default("Windows-XP"), ThemeKind::WinXp);
+        assert_eq!(ThemeKind::from_str_or_default("xp"), ThemeKind::WinXp);
+        // Unknown falls back to Tron.
+        assert_eq!(ThemeKind::from_str_or_default("beos"), ThemeKind::Tron);
+    }
+
+    #[test]
+    fn next_cycle_visits_every_theme_once() {
+        let mut seen = vec![ThemeKind::Tron];
+        let mut cur = ThemeKind::Tron;
+        for _ in 0..ThemeKind::ALL.len() {
+            cur = cur.next();
+            if cur == ThemeKind::Tron {
+                break;
+            }
+            seen.push(cur);
+        }
+        assert_eq!(seen.len(), ThemeKind::ALL.len());
+        for k in ThemeKind::ALL {
+            assert!(seen.contains(&k), "cycle skipped {k:?}");
+        }
+    }
+
+    /// Every theme must paint its boot and right-panel animation across a spread
+    /// of sizes — including degenerate ones — without panicking or indexing the
+    /// buffer out of bounds.
+    #[test]
+    fn all_themes_render_within_bounds() {
+        let sizes = [(1u16, 1u16), (4, 3), (16, 12), (60, 30), (120, 50)];
+        let times = [0u64, 500, 2500, 4900, 9000];
+        for kind in ThemeKind::ALL {
+            let theme = theme_for(kind);
+            for &(w, h) in &sizes {
+                let area = Rect::new(0, 0, w, h);
+                for &t in &times {
+                    let d = Duration::from_millis(t);
+                    let mut boot = Buffer::empty(area);
+                    theme.render_boot(d, area, &mut boot);
+                    let mut anim = Buffer::empty(area);
+                    theme.render_animation(area, d, &mut anim);
+                }
+            }
+        }
     }
 }
