@@ -224,9 +224,9 @@ impl Theme for Umbrella {
     }
 
     /// Boot: red facility diagnostics scroll, then an actual umbrella spins up
-    /// at centre — a domed canopy of eight ribs sweeping around a hazard hub
-    /// above its crooked handle — while "UMBRELLA CORP" and "CONTAINMENT
-    /// ONLINE" lock in. Any key skips it.
+    /// at centre — a canopy of eight ribs seen from above, sweeping around a
+    /// central hazard hub — while "UMBRELLA CORP" and "CONTAINMENT ONLINE"
+    /// lock in. Any key skips it.
     fn render_boot(&self, elapsed: Duration, area: Rect, buf: &mut Buffer) {
         let pal = &self.palette;
         boot::fill_bg(area, buf, pal.bg);
@@ -404,23 +404,8 @@ impl Theme for Umbrella {
                 }
             }
 
-            // Hazard hub and crooked handle.
+            // Hazard hub — the ferrule tip at the crown, all a top-down view shows.
             boot::put(buf, area, cxi, cy.round() as u16, '◉', pal.accent, pal.bg);
-            let base_y = (cy + ry).round() as u16;
-            let steel = anim::blend(pal.bg, pal.secondary, up);
-            for h in 1..=3u16 {
-                boot::put(buf, area, cxi, base_y + h, '|', steel, pal.bg);
-            }
-            boot::put(
-                buf,
-                area,
-                cxi.saturating_sub(1),
-                base_y + 4,
-                '_',
-                steel,
-                pal.bg,
-            );
-            boot::put(buf, area, cxi, base_y + 4, '/', steel, pal.bg);
         }
 
         // Phase 3 — the wordmark rises above the canopy.
