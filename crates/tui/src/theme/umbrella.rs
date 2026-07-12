@@ -46,18 +46,24 @@ impl Default for Umbrella {
     }
 }
 
-/// Clean umbrella emblem — a domed canopy with a scalloped rim, pole, and a
-/// crooked handle. Every line is padded to the same width so per-line centering
-/// keeps the icon rigid wherever the logo is rendered.
+/// Clean umbrella emblem — the canopy seen from directly above: an octagonal
+/// rim, eight ribs radiating from a central ferrule, quartered into panels.
+/// Mirrors the top-view parasol the boot sequence spins up. Every line is
+/// padded to the same width so per-line centering keeps the icon rigid
+/// wherever the logo is rendered.
 const LOGO: &[&str] = &[
-    r"         .-~~~-.         ",
-    r"       .'       '.       ",
-    r"      /___________\      ",
-    r"      \/\/\/\/\/\/\/      ",
-    r"            |            ",
-    r"            |            ",
-    r"           _/            ",
-    r"  U M B R E L L A   C O R P  ",
+    r"      _________      ",
+    r"    /     |     \    ",
+    r"  / \     |     / \  ",
+    r"|     \   |   /     |",
+    r"|       \ | /       |",
+    r"|---------◉---------|",
+    r"|       / | \       |",
+    r"|     /   |   \     |",
+    r"  \ /     |     \ /  ",
+    r"    \     |     /    ",
+    r"      _________      ",
+    r"    UMBRELLA CORP    ",
 ];
 
 /// Cold boot diagnostics that scroll before the parasol spins up — the

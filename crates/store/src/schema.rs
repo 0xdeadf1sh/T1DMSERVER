@@ -1,12 +1,9 @@
 //! Schema DDL and the migration runner. The whole schema is one migration
-//! for now; add higher-versioned steps below and bump [`LATEST_VERSION`].
+//! for now.
 
 use rusqlite::Connection;
 
 use crate::error::Result;
-
-/// The current head schema version.
-pub const LATEST_VERSION: i64 = 2;
 
 /// PRAGMAs applied to every connection (writer and pooled readers).
 pub const CONNECTION_PRAGMAS: &str = "\
