@@ -397,6 +397,33 @@ fn photo_write_read_and_teardown_clears_them() {
         .is_empty());
 }
 
+// With a live token referenced by a session, teardown must not abort partway
+// on the implicit `DELETE FROM token` (foreign_keys = ON) — the whole schema
+// has to come back so a follow-up generation writes cleanly.
+#[test]
+fn teardown_with_referencing_session_recreates_schema_and_allows_generate() {
+    let ts = TempStore::new();
+    let (tok, _secret) = ts.mint_token(TokenKind::Rw, Some("phone".into())).unwrap();
+    ts.upsert_session(tok.id, "10.0.0.2", "agent", "device-a")
+        .unwrap();
+
+    ts.teardown().expect("teardown must succeed despite FK edge");
+
+    // Every dropped table is back and empty.
+    assert!(ts.list_tokens(true).unwrap().is_empty());
+    assert!(ts.list_sessions().unwrap().is_empty());
+    assert!(ts
+        .get_samples(&Series::ALL, None, None, None, None)
+        .unwrap()
+        .is_empty());
+
+    // The reported failure: generation must now write straight into `samples`.
+    let written = ts
+        .generate_fake(FakeRange::last_days(1), FakeOpts::default())
+        .expect("generate after teardown must not hit a missing table");
+    assert!(written > 200, "≈288 grid rows over a day, got {written}");
+}
+
 #[test]
 fn refresh_models_hashes_and_preserves_opaque_meta() {
     let ts = TempStore::new();

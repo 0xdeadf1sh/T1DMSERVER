@@ -129,6 +129,11 @@ impl Store {
     /// directory. The models directory is left untouched.
     pub fn teardown(&self) -> Result<()> {
         self.with_writer(|c| {
+            // Drop with FK enforcement off: DROP TABLE performs an implicit
+            // DELETE, so dropping a parent (`token`) while a child (`session`)
+            // still references it would otherwise abort the batch mid-way and
+            // leave the schema half-torn. CONNECTION_PRAGMAS restores it to ON.
+            c.execute_batch("PRAGMA foreign_keys = OFF;")?;
             c.execute_batch(schema::DROP_ALL)?;
             c.execute_batch(schema::CONNECTION_PRAGMAS)?;
             schema::migrate(c)?;

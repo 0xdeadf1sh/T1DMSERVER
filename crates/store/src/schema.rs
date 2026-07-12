@@ -156,16 +156,19 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Drop every data table (teardown). `schema_migrations` is preserved so the
-/// recreate path re-runs cleanly; callers immediately re-`migrate`.
+/// Drop every table (teardown), including `schema_migrations` — so the caller's
+/// immediate re-`migrate` rebuilds the whole schema from version 0. Children are
+/// listed before parents (`session` before `token`) and the caller disables
+/// foreign-key enforcement for the batch, so the implicit per-drop DELETE can't
+/// abort on a dangling reference.
 pub const DROP_ALL: &str = r#"
 DROP TABLE IF EXISTS samples;
 DROP TABLE IF EXISTS prediction;
 DROP TABLE IF EXISTS note;
 DROP TABLE IF EXISTS photo;
 DROP TABLE IF EXISTS alert;
-DROP TABLE IF EXISTS token;
 DROP TABLE IF EXISTS session;
+DROP TABLE IF EXISTS token;
 DROP TABLE IF EXISTS model;
 DROP TABLE IF EXISTS stats_cache;
 DROP TABLE IF EXISTS schema_migrations;
