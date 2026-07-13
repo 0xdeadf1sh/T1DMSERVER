@@ -3,38 +3,44 @@
 
 use rusqlite::{params, OptionalExtension, Row};
 
-use t1dm_core::{Alert, Note, Photo, Prediction, SampleRow, Series, TOD_BINS};
+use t1dm_core::{Alert, Circadian, Note, Photo, PredictionEvent, SampleRow, Series};
 
 use crate::error::Result;
 use crate::Store;
 
+// (#5) carbs/bolus/basal demoted to curve events; `received_at` is the
+// internal server clock and is NOT served (skipped on the wire in the
+// `SampleRow` serde definition, §2.3) — it is read here only to populate the
+// struct's internal field.
 const SAMPLE_COLS: &str =
-    "ts, tz_offset, bg, carbs, bolus, basal, hr, steps, sleep, exercise, mood, updated_at";
+    "ts, tz_offset, bg, hr, steps, sleep, exercise, mood, updated_at, received_at";
 
 fn map_sample(row: &Row<'_>) -> rusqlite::Result<SampleRow> {
     Ok(SampleRow {
         ts: row.get(0)?,
         tz_offset: row.get(1)?,
         bg: row.get(2)?,
-        carbs: row.get(3)?,
-        bolus: row.get(4)?,
-        basal: row.get(5)?,
-        hr: row.get(6)?,
-        steps: row.get(7)?,
-        sleep: row.get(8)?,
-        exercise: row.get(9)?,
-        mood: row.get(10)?,
-        updated_at: row.get(11)?,
+        hr: row.get(3)?,
+        steps: row.get(4)?,
+        sleep: row.get(5)?,
+        exercise: row.get(6)?,
+        mood: row.get(7)?,
+        updated_at: row.get(8)?,
+        received_at: row.get(9)?,
     })
 }
+
+const NOTE_COLS: &str = "id, client_id, ts, tz_offset, text, updated_at, created_at";
 
 fn map_note(row: &Row<'_>) -> rusqlite::Result<Note> {
     Ok(Note {
         id: row.get(0)?,
-        ts: row.get(1)?,
-        tz_offset: row.get(2)?,
-        text: row.get(3)?,
-        created_at: row.get(4)?,
+        client_id: row.get(1)?,
+        ts: row.get(2)?,
+        tz_offset: row.get(3)?,
+        text: row.get(4)?,
+        updated_at: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
@@ -51,38 +57,39 @@ fn map_photo(row: &Row<'_>) -> rusqlite::Result<Photo> {
     })
 }
 
+const ALERT_COLS: &str = "id, client_id, ts, kind, payload, origin_token, created_at";
+
 fn map_alert(row: &Row<'_>) -> rusqlite::Result<Alert> {
-    let payload_txt: String = row.get(3)?;
+    let payload_txt: String = row.get(4)?;
     let payload = serde_json::from_str(&payload_txt).unwrap_or(serde_json::Value::Null);
     Ok(Alert {
         id: row.get(0)?,
-        ts: row.get(1)?,
-        kind: row.get(2)?,
+        client_id: row.get(1)?,
+        ts: row.get(2)?,
+        kind: row.get(3)?,
         payload,
-        origin_token: row.get(4)?,
-        created_at: row.get(5)?,
+        origin_token: row.get(5)?,
+        created_at: row.get(6)?,
     })
 }
 
-fn map_prediction(row: &Row<'_>) -> rusqlite::Result<Prediction> {
-    let line_txt: String = row.get(4)?;
-    let fan_txt: String = row.get(5)?;
-    let tod_txt: String = row.get(6)?;
-    Ok(Prediction {
-        id: row.get(0)?,
-        made_at: row.get(1)?,
-        model_id: row.get(2)?,
-        horizon_steps: row.get(3)?,
+fn map_prediction(row: &Row<'_>) -> rusqlite::Result<PredictionEvent> {
+    let line_txt: String = row.get(3)?;
+    let fan_txt: String = row.get(4)?;
+    let circadian_txt: Option<String> = row.get(5)?;
+    Ok(PredictionEvent {
+        made_at: row.get(0)?,
+        model_id: row.get(1)?,
+        updated_at: row.get(2)?,
+        horizon_steps: row.get(6)?,
         line: serde_json::from_str(&line_txt).unwrap_or_default(),
         fan: serde_json::from_str(&fan_txt).unwrap_or_default(),
-        tod: serde_json::from_str(&tod_txt).unwrap_or_else(|_| vec![0.0; TOD_BINS]),
-        tod_conf: row.get(7)?,
-        created_at: row.get(8)?,
+        circadian: circadian_txt
+            .and_then(|s| serde_json::from_str::<Circadian>(&s).ok()),
     })
 }
 
-const PRED_COLS: &str =
-    "id, made_at, model_id, horizon_steps, line, fan, tod, tod_conf, created_at";
+const PRED_COLS: &str = "made_at, model_id, updated_at, line, fan, circadian, horizon_steps";
 
 impl Store {
     /// Fetch wide sample rows in `[from, to]` (epoch ms), paginating forward
@@ -113,7 +120,11 @@ impl Store {
     }
 
     /// Predictions with `made_at` in `[from, to]`, newest first.
-    pub fn get_predictions(&self, from: Option<i64>, to: Option<i64>) -> Result<Vec<Prediction>> {
+    pub fn get_predictions(
+        &self,
+        from: Option<i64>,
+        to: Option<i64>,
+    ) -> Result<Vec<PredictionEvent>> {
         let lo = from.unwrap_or(i64::MIN);
         let hi = to.unwrap_or(i64::MAX);
         self.with_reader(|conn| {
@@ -129,7 +140,7 @@ impl Store {
     }
 
     /// The single most recent prediction, if any.
-    pub fn get_prediction_latest(&self) -> Result<Option<Prediction>> {
+    pub fn get_prediction_latest(&self) -> Result<Option<PredictionEvent>> {
         self.with_reader(|conn| {
             let sql = format!("SELECT {PRED_COLS} FROM prediction ORDER BY made_at DESC LIMIT 1");
             let out = conn.query_row(&sql, [], map_prediction).optional()?;
@@ -142,10 +153,10 @@ impl Store {
         let lo = from.unwrap_or(i64::MIN);
         let hi = to.unwrap_or(i64::MAX);
         self.with_reader(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, ts, tz_offset, text, created_at FROM note
-                 WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts DESC",
-            )?;
+            let sql = format!(
+                "SELECT {NOTE_COLS} FROM note WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts DESC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
                 .query_map(params![lo, hi], map_note)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -158,10 +169,10 @@ impl Store {
         let lo = from.unwrap_or(i64::MIN);
         let hi = to.unwrap_or(i64::MAX);
         self.with_reader(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, ts, kind, payload, origin_token, created_at FROM alert
-                 WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts DESC",
-            )?;
+            let sql = format!(
+                "SELECT {ALERT_COLS} FROM alert WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts DESC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
                 .query_map(params![lo, hi], map_alert)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -195,5 +206,23 @@ impl Store {
                 .optional()?)
         })?;
         Ok(rel.map(|r| self.data_dir().join(r)))
+    }
+
+    /// The server's `store_epoch` marker, minted once when the schema is
+    /// first created and surfaced (authed) via `GET /v1/health` (§3.8).
+    /// `None` before the first mint. It is an opaque, clock-free identity —
+    /// not a timestamp — that the phone compares against its last-mirrored
+    /// epoch to detect a freshly-wiped/new server and trigger a full
+    /// re-mirror of its authoritative history.
+    pub fn store_epoch(&self) -> Result<Option<String>> {
+        self.with_reader(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'store_epoch'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
     }
 }

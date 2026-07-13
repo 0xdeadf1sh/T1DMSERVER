@@ -24,7 +24,7 @@ use ratatui::crossterm::execute;
 use tokio::sync::broadcast;
 
 use store::Store;
-use t1dm_core::{Alert, Config, Note, Photo, Prediction, SampleRow};
+use t1dm_core::{Alert, Config, Note, Photo, PredictionEvent, SampleRow};
 
 use crate::app::App;
 use crate::boot::BootSequence;
@@ -52,7 +52,7 @@ pub type Result<T = ()> =
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     Sample(SampleRow),
-    Prediction(Prediction),
+    Prediction(PredictionEvent),
     Note(Note),
     Photo(Photo),
     Alert(Alert),

@@ -1,11 +1,13 @@
 //! Synthetic dataset generation for the Developer pane — a plausible BG
-//! trace (diurnal sine + meal excursions + noise, clamped 40–400) with
-//! matching carbs/insulin, a widening prediction fan, and a few notes.
+//! trace (diurnal sine + meal excursions + noise, clamped 40–400) over the
+//! demoted scalar series (bg/hr/steps/sleep/exercise/mood), plus a widening
+//! prediction fan with a synthetic circadian head and a few notes. Carbs and
+//! insulin are now first-class curve events, generated elsewhere, not here.
 
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
 
-use t1dm_core::{IngestBundle, IngestPrediction, QUANTILE_LEVELS, TOD_BINS};
+use t1dm_core::{Circadian, IngestBundle, PredictionWrite, QUANTILE_LEVELS};
 
 use crate::error::Result;
 use crate::Store;
@@ -61,6 +63,7 @@ impl Store {
         let mut rng = SmallRng::seed_from_u64(opts.seed);
         let day_ms = 86_400_000.0;
 
+        let now = crate::now_ms();
         let mut written = 0usize;
         let mut ts = from;
         let mut last_pred_ts = from;
@@ -68,11 +71,10 @@ impl Store {
         while ts <= to {
             let tod = ((ts % 86_400_000) as f64) / day_ms; // 0..1 fraction of day
             let bg = synth_bg(tod, &mut rng);
-            let (carbs, bolus) = meal_at(tod, &mut rng);
-            let basal = 0.8 + 0.1 * (tod * std::f64::consts::TAU).sin();
             let hr =
                 62.0 + 18.0 * (tod * std::f64::consts::TAU).sin() + rng.random_range(-4.0..4.0);
-            let steps = if carbs > 0.0 {
+            // A burst of steps within each post-prandial window.
+            let steps = if meal_excursion(tod) > 20.0 {
                 rng.random_range(0.0..120.0)
             } else {
                 0.0
@@ -81,29 +83,26 @@ impl Store {
             let bundle = IngestBundle {
                 ts,
                 tz_offset: 0,
+                updated_at: now,
                 bg: Some(bg),
-                carbs: (carbs > 0.0).then_some(carbs),
-                bolus: (bolus > 0.0).then_some(bolus),
-                basal: Some(basal),
                 hr: Some(hr),
                 steps: Some(steps),
                 sleep: Some(if tod < 0.30 { 1.0 } else { 0.0 }),
                 exercise: Some(0.0),
                 mood: Some(rng.random_range(3..=5)),
-                prediction: None,
-                notes: Vec::new(),
             };
             self.ingest_bundle(&bundle)?;
             written += 1;
 
             if opts.with_predictions && ts - last_pred_ts >= 6 * t1dm_core::GRID_MS {
-                let pred = synth_prediction(bg, opts.horizon_steps, &mut rng);
+                let pred = synth_prediction(bg, ts, now, opts.horizon_steps, &mut rng);
                 self.put_predictions(std::slice::from_ref(&pred))?;
                 last_pred_ts = ts;
             }
 
             if opts.with_notes && rng.random_bool(0.01) {
-                let _ = self.add_note(ts, 0, sample_note(&mut rng));
+                let client_id = format!("fake-note-{ts}");
+                let _ = self.add_note(&client_id, ts, 0, sample_note(&mut rng), now);
             }
 
             ts += t1dm_core::GRID_MS;
@@ -132,21 +131,15 @@ fn meal_excursion(tod: f64) -> f64 {
         .sum()
 }
 
-/// Carbs and bolus fired at meal centers.
-fn meal_at(tod: f64, rng: &mut SmallRng) -> (f64, f64) {
-    let centers = [0.30, 0.51, 0.78];
-    for &c in &centers {
-        if (tod - c).abs() < 0.004 {
-            let carbs: f64 = rng.random_range(30.0..70.0);
-            let bolus: f64 = carbs / 10.0 + rng.random_range(-0.5..0.5);
-            return (carbs.round(), (bolus.max(0.5) * 10.0).round() / 10.0);
-        }
-    }
-    (0.0, 0.0)
-}
-
-/// A widening quantile fan around a plausible near-future median.
-fn synth_prediction(bg_now: f64, horizon: i32, rng: &mut SmallRng) -> IngestPrediction {
+/// A widening quantile fan around a plausible near-future median, keyed at
+/// `made_at` with the phone `updated_at` carried verbatim.
+fn synth_prediction(
+    bg_now: f64,
+    made_at: i64,
+    updated_at: i64,
+    horizon: i32,
+    rng: &mut SmallRng,
+) -> PredictionWrite {
     let h = horizon.max(1) as usize;
     let drift = rng.random_range(-1.5..1.5);
     let line: Vec<f64> = (0..h)
@@ -167,15 +160,41 @@ fn synth_prediction(bg_now: f64, horizon: i32, rng: &mut SmallRng) -> IngestPred
         })
         .collect();
 
-    let tod: Vec<f64> = (0..TOD_BINS).map(|_| rng.random_range(0.0..2.0)).collect();
-
-    IngestPrediction {
+    PredictionWrite {
+        made_at,
         model_id: "synthetic".to_string(),
+        updated_at,
         horizon_steps: horizon,
         line,
         fan,
-        tod,
-        tod_conf: rng.random_range(0.4..0.95),
+        circadian: Some(synth_circadian(rng)),
+    }
+}
+
+/// A synthetic circadian belief over twelve two-hour bins.
+fn synth_circadian(rng: &mut SmallRng) -> Circadian {
+    const N_BINS: i32 = 12;
+    const BIN_HOURS: f64 = 2.0;
+    let raw: Vec<f64> = (0..N_BINS).map(|_| rng.random_range(0.0..1.0)).collect();
+    let sum: f64 = raw.iter().sum::<f64>().max(1e-9);
+    let probs: Vec<f64> = raw.iter().map(|p| p / sum).collect();
+    let arg = probs
+        .iter()
+        .enumerate()
+        .fold((0usize, f64::MIN), |(bi, bv), (i, &v)| {
+            if v > bv {
+                (i, v)
+            } else {
+                (bi, bv)
+            }
+        })
+        .0;
+    Circadian {
+        probs,
+        predicted_hour: (arg as f64 + 0.5) * BIN_HOURS,
+        resultant_r: rng.random_range(0.3..0.95),
+        n_bins: N_BINS,
+        bin_hours: BIN_HOURS,
     }
 }
 

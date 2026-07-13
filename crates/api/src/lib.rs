@@ -38,8 +38,13 @@ pub fn build_router(store: Store, hub: WsHub) -> Router {
 
     let v1 = Router::new()
         .route("/ingest", post(handlers::ingest))
-        .route("/series/{name}", put(handlers::put_series))
         .route("/series", get(handlers::get_series))
+        .route("/meals", put(handlers::put_meals).get(handlers::get_meals))
+        .route("/doses", put(handlers::put_doses).get(handlers::get_doses))
+        .route(
+            "/basal-schedule",
+            put(handlers::put_basal_schedule).get(handlers::get_basal_schedule),
+        )
         .route(
             "/predictions",
             put(handlers::put_predictions).get(handlers::get_predictions),
@@ -58,7 +63,7 @@ pub fn build_router(store: Store, hub: WsHub) -> Router {
         .route("/models", get(handlers::get_models))
         .route("/models/{id}/meta", get(handlers::get_model_meta))
         .route("/models/{id}/download", get(handlers::get_model_file))
-        .route("/stats", get(handlers::get_stats))
+        .route("/stats", put(handlers::put_stats).get(handlers::get_stats))
         .route("/health", get(handlers::get_health))
         .route("/stream", get(handlers::ws_stream));
 

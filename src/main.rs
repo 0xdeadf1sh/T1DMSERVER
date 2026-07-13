@@ -62,23 +62,6 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Daily statistics cache: compute all windows once at startup, then on a
-    // fixed TTL cadence, so `GET /v1/stats` serves a pre-warmed result.
-    let stats_store = store.clone();
-    rt.spawn(async move {
-        let period = std::time::Duration::from_millis(store::STATS_CACHE_TTL_MS as u64);
-        let mut tick = tokio::time::interval(period);
-        loop {
-            tick.tick().await;
-            let s = stats_store.clone();
-            match tokio::task::spawn_blocking(move || s.refresh_stats_cache()).await {
-                Ok(Ok(())) => tracing::debug!("stats cache refreshed"),
-                Ok(Err(e)) => tracing::warn!("stats cache refresh failed: {e}"),
-                Err(e) => tracing::warn!("stats cache refresh task panicked: {e}"),
-            }
-        }
-    });
-
     // Filesystem watch on the models directory (kept alive until shutdown).
     let _watcher = match start_model_watcher(store.clone()) {
         Ok(w) => Some(w),
@@ -128,6 +111,9 @@ async fn bridge_events(hub: WsHub, tui_tx: broadcast::Sender<AppEvent>) {
                     Event::Note(n) => AppEvent::Note(n),
                     Event::Photo(p) => AppEvent::Photo(p),
                     Event::Alert(a) => AppEvent::Alert(a),
+                    // Meal/Dose/BasalSchedule/Stats carry no footer indicator; the dashboard
+                    // reconstructs them from the store on its tick refresh.
+                    Event::Meal(_) | Event::Dose(_) | Event::BasalSchedule(_) | Event::Stats(_) => continue,
                 };
                 let _ = tui_tx.send(ev);
             }

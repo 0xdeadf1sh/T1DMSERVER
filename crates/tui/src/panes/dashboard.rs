@@ -17,7 +17,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::Frame;
 
-use t1dm_core::{snap_grid, BgUnit, SampleRow, Series, GRID_MS, TOD_BINS};
+use store::ReconstructedChannels;
+use t1dm_core::{snap_grid, BgUnit, Series, GRID_MS, TOD_BINS};
 
 use super::{Action, Ctx, PaneView};
 use crate::boot::{put, put_str};
@@ -75,11 +76,15 @@ impl InsulinDisplay {
             InsulinDisplay::Basal => "basal",
         }
     }
-    fn value(self, r: &SampleRow) -> Option<f64> {
+    /// Select this display's insulin channel from the reconstructed curves.
+    /// `Total` is the element-wise bolus+basal sum; the §4-#6 basal XOR is
+    /// already applied inside `reconstruct_channels`, so bolus and basal never
+    /// double-count a scheduled-plus-injected background.
+    fn select(self, ch: &ReconstructedChannels) -> Vec<(i64, f64)> {
         match self {
-            InsulinDisplay::Total => r.total_insulin(),
-            InsulinDisplay::Bolus => r.bolus,
-            InsulinDisplay::Basal => r.basal,
+            InsulinDisplay::Total => sum_by_ts(&ch.bolus, &ch.basal),
+            InsulinDisplay::Bolus => ch.bolus.clone(),
+            InsulinDisplay::Basal => ch.basal.clone(),
         }
     }
 }
@@ -204,14 +209,19 @@ impl PaneView for DashboardPane {
             .iter()
             .filter_map(|r| r.bg.map(|v| (r.ts, v)))
             .collect();
-        let ins_pts: Vec<(i64, f64)> = samples
-            .iter()
-            .filter_map(|r| self.insulin.value(r).map(|v| (r.ts, v)))
-            .collect();
-        let carb_pts: Vec<(i64, f64)> = samples
-            .iter()
-            .filter_map(|r| r.carbs.map(|v| (r.ts, v)))
-            .collect();
+        // Insulin and carb strips are reconstructed from the stored
+        // meal/dose/basal events — each row resolved from its verbatim
+        // custom_curve when present, else the ported gamma/Bateman params —
+        // bucketized onto the grid with the §4-#6 basal XOR applied. The
+        // demoted `samples` scalars no longer carry carbs/bolus/basal, so this
+        // is the sole strip source. Display-only; not part of any byte-exact
+        // guarantee.
+        let channels = ctx
+            .store
+            .reconstruct_channels(t_left, t_right)
+            .unwrap_or_default();
+        let ins_pts: Vec<(i64, f64)> = self.insulin.select(&channels);
+        let carb_pts: Vec<(i64, f64)> = channels.carb.clone();
         let hr_pts: Vec<(i64, f64)> = samples
             .iter()
             .filter_map(|r| r.hr.map(|v| (r.ts, v)))
@@ -248,10 +258,16 @@ impl PaneView for DashboardPane {
                     fan_pts.push((base + i as i64 * GRID_MS, q));
                 }
             }
-            if p.tod.len() == TOD_BINS {
-                tod = p.tod.clone();
+            // The prediction now carries a nested circadian belief (or `None`
+            // when the model has no time head), not a zeroed 12-vector. Map its
+            // probabilities onto the fixed gauge width and use the resultant
+            // vector length as the confidence.
+            if let Some(c) = &p.circadian {
+                if c.probs.len() == TOD_BINS {
+                    tod = c.probs.clone();
+                }
+                conf = c.resultant_r;
             }
-            conf = p.tod_conf;
         }
 
         // --- value axis: always straddle the 70/180 thresholds -------------
@@ -595,6 +611,18 @@ fn current_bin(now_ms: i64, tz_offset: i32) -> usize {
     let local = now_ms + tz_offset as i64 * 60_000;
     let hours = local.div_euclid(3_600_000).rem_euclid(24);
     (hours / 2) as usize
+}
+
+/// Element-wise sum of two grid-bucketed channels keyed by timestamp, used to
+/// derive the `Total` insulin strip from the reconstructed bolus and basal
+/// curves. Both arrive dense over the same window, so this is an aligned add;
+/// the `BTreeMap` keeps the output ts-sorted and tolerates any length skew.
+fn sum_by_ts(a: &[(i64, f64)], b: &[(i64, f64)]) -> Vec<(i64, f64)> {
+    let mut merged: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+    for &(ts, v) in a.iter().chain(b.iter()) {
+        *merged.entry(ts).or_insert(0.0) += v;
+    }
+    merged.into_iter().collect()
 }
 
 /// Human-readable zoom, e.g. `5m`, `1.5h`, `30s`.

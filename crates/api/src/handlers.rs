@@ -13,7 +13,10 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use t1dm_core::{IngestBundle, IngestPrediction, Series, SeriesUpsert, StatsWindow};
+use t1dm_core::{
+    BasalSchedule, DoseEvent, IngestBundle, MealEvent, PredictionWrite, Series, Stats, StatsBlock,
+    StatsWindow,
+};
 
 use crate::auth::{Auth, RwAuth};
 use crate::error::{ApiError, ApiResult};
@@ -31,7 +34,7 @@ pub struct RangeQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct SeriesQuery {
-    /// Comma-separated field list, e.g. `bg,carbs,hr`.
+    /// Comma-separated field list, e.g. `bg,hr,steps`.
     pub fields: Option<String>,
     pub from: Option<i64>,
     pub to: Option<i64>,
@@ -42,10 +45,6 @@ pub struct SeriesQuery {
 #[derive(Debug, Deserialize)]
 pub struct StatsQuery {
     pub window: Option<String>,
-    /// Force a fresh compute, bypassing the daily cache. Any of `1`/`true`/
-    /// `yes`/`on` (case-insensitive) is truthy; parsed as a string because the
-    /// query deserializer only accepts `true`/`false` for a bare `bool`.
-    pub refresh: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,18 +54,30 @@ pub struct WsQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct NoteBody {
+    pub client_id: String,
     pub ts: i64,
     #[serde(default)]
     pub tz_offset: i32,
     pub text: String,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AlertBody {
+    pub client_id: String,
     pub ts: i64,
     pub kind: String,
     #[serde(default)]
     pub payload: Value,
+}
+
+/// Thin key extractor for the opaque stats block: the phone `Stats` JSON is
+/// stored verbatim, but the server needs `window` (the primary key) and the
+/// phone `updated_at` (the idempotency guard) to persist it.
+#[derive(Debug, Deserialize)]
+struct StatsKey {
+    window: String,
+    updated_at: i64,
 }
 
 fn parse_fields(spec: &Option<String>) -> Result<Vec<Series>, ApiError> {
@@ -84,9 +95,10 @@ fn parse_fields(spec: &Option<String>) -> Result<Vec<Series>, ApiError> {
 
 pub async fn ingest(
     State(app): State<AppState>,
-    _auth: RwAuth,
+    auth: RwAuth,
     Json(bundle): Json<IngestBundle>,
 ) -> ApiResult<Json<Value>> {
+    let origin = auth.0.token.id;
     let ts = bundle.ts;
     let store = app.store.clone();
     // Ingest and read the resulting row back in one blocking hop.
@@ -99,28 +111,68 @@ pub async fn ingest(
     })
     .await?;
     if let Some(row) = row {
-        app.hub.broadcast(Event::Sample(row));
+        app.hub.broadcast_except(Event::Sample(row), origin);
     }
     Ok(Json(json!({ "ok": true, "ts": ts })))
 }
 
-pub async fn put_series(
+/// Idempotent batch upsert of meal-curve events, keyed by phone `client_id`.
+/// A redelivery is a no-op; a newer `updated_at` replaces in place. Every
+/// stored row fans out to every session except the origin token's.
+pub async fn put_meals(
     State(app): State<AppState>,
-    _auth: RwAuth,
-    Path(name): Path<String>,
-    Json(body): Json<SeriesUpsert>,
+    auth: RwAuth,
+    Json(meals): Json<Vec<MealEvent>>,
 ) -> ApiResult<Json<Value>> {
-    let series = Series::from_str(&name)?;
+    let origin = auth.0.token.id;
     let store = app.store.clone();
-    let n = blocking(move || store.upsert_samples(series, &body.samples)).await?;
-    Ok(Json(json!({ "ok": true, "written": n })))
+    let stored = blocking(move || store.put_meals(&meals)).await?;
+    let ids: Vec<String> = stored.iter().map(|m| m.client_id.clone()).collect();
+    for meal in stored {
+        app.hub.broadcast_except(Event::Meal(meal), origin);
+    }
+    Ok(Json(json!({ "ok": true, "ids": ids })))
+}
+
+/// Idempotent batch upsert of dose-curve events (bolus/basal), keyed by phone
+/// `client_id`. Fans out except-origin.
+pub async fn put_doses(
+    State(app): State<AppState>,
+    auth: RwAuth,
+    Json(doses): Json<Vec<DoseEvent>>,
+) -> ApiResult<Json<Value>> {
+    let origin = auth.0.token.id;
+    let store = app.store.clone();
+    let stored = blocking(move || store.put_doses(&doses)).await?;
+    let ids: Vec<String> = stored.iter().map(|d| d.client_id.clone()).collect();
+    for dose in stored {
+        app.hub.broadcast_except(Event::Dose(dose), origin);
+    }
+    Ok(Json(json!({ "ok": true, "ids": ids })))
+}
+
+/// Full-replace the active basal schedule (a daily-repeating template the TUI
+/// tiles). Idempotent per-slot on `client_id`; fans out except-origin.
+pub async fn put_basal_schedule(
+    State(app): State<AppState>,
+    auth: RwAuth,
+    Json(schedule): Json<BasalSchedule>,
+) -> ApiResult<Json<Value>> {
+    let origin = auth.0.token.id;
+    let store = app.store.clone();
+    let stored = blocking(move || store.put_basal_schedule(&schedule)).await?;
+    let ids: Vec<String> = stored.slots.iter().map(|s| s.client_id.clone()).collect();
+    app.hub
+        .broadcast_except(Event::BasalSchedule(stored), origin);
+    Ok(Json(json!({ "ok": true, "ids": ids })))
 }
 
 pub async fn put_predictions(
     State(app): State<AppState>,
-    _auth: RwAuth,
-    Json(preds): Json<Vec<IngestPrediction>>,
+    auth: RwAuth,
+    Json(preds): Json<Vec<PredictionWrite>>,
 ) -> ApiResult<Json<Value>> {
+    let origin = auth.0.token.id;
     let store = app.store.clone();
     let (ids, latest) = blocking(move || {
         let ids = store.put_predictions(&preds)?;
@@ -128,29 +180,74 @@ pub async fn put_predictions(
         Ok((ids, latest))
     })
     .await?;
-    // Surface the newest prediction to live listeners.
+    // Surface the newest prediction to live listeners, except the origin.
     if let Some(latest) = latest {
-        app.hub.broadcast(Event::Prediction(latest));
+        app.hub.broadcast_except(Event::Prediction(latest), origin);
     }
     Ok(Json(json!({ "ok": true, "ids": ids })))
 }
 
+/// Store a phone-pushed statistics block for one window verbatim. The body is
+/// the opaque phone `Stats` JSON; only `window` and `updated_at` are peeled
+/// off to key and guard the upsert. Fans out except-origin.
+pub async fn put_stats(
+    State(app): State<AppState>,
+    auth: RwAuth,
+    body: Bytes,
+) -> ApiResult<Json<Value>> {
+    let origin = auth.0.token.id;
+    let raw = std::str::from_utf8(body.as_ref())
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .to_string();
+    let key: StatsKey =
+        serde_json::from_str(&raw).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let value: Value =
+        serde_json::from_str(&raw).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let window = key.window;
+    let updated_at = key.updated_at;
+    let store = app.store.clone();
+    let store_window = window.clone();
+    // Persist the phone clock verbatim; `put_stats_block` guards on `updated_at`.
+    blocking(move || store.put_stats_block(&store_window, &raw, updated_at)).await?;
+    app.hub.broadcast_except(
+        Event::Stats(StatsBlock {
+            window: window.clone(),
+            updated_at,
+            json: value,
+        }),
+        origin,
+    );
+    Ok(Json(json!({ "ok": true, "window": window })))
+}
+
 pub async fn post_note(
     State(app): State<AppState>,
-    _auth: RwAuth,
+    auth: RwAuth,
     Json(body): Json<NoteBody>,
 ) -> ApiResult<Json<Value>> {
+    let origin = auth.0.token.id;
     let store = app.store.clone();
-    let note = blocking(move || store.add_note(body.ts, body.tz_offset, &body.text)).await?;
-    app.hub.broadcast(Event::Note(note.clone()));
-    Ok(Json(json!({ "ok": true, "id": note.id })))
+    let note = blocking(move || {
+        store.add_note(
+            &body.client_id,
+            body.ts,
+            body.tz_offset,
+            &body.text,
+            body.updated_at,
+        )
+    })
+    .await?;
+    app.hub.broadcast_except(Event::Note(note.clone()), origin);
+    Ok(Json(json!({ "ok": true, "id": note.client_id })))
 }
 
 pub async fn post_photo(
     State(app): State<AppState>,
-    _auth: RwAuth,
+    auth: RwAuth,
     mut multipart: Multipart,
 ) -> ApiResult<Json<Value>> {
+    let origin = auth.0.token.id;
     let mut ts: Option<i64> = None;
     let mut data: Option<Bytes> = None;
     let mut ext = String::from("jpg");
@@ -190,7 +287,7 @@ pub async fn post_photo(
     let store = app.store.clone();
     // Dimensions are decoded by the TUI/importer; unknown at upload time.
     let photo = blocking(move || store.add_photo(ts, &data, 0, 0, &ext)).await?;
-    app.hub.broadcast(Event::Photo(photo.clone()));
+    app.hub.broadcast_except(Event::Photo(photo.clone()), origin);
     Ok(Json(
         json!({ "ok": true, "id": photo.id, "sha256": photo.sha256 }),
     ))
@@ -203,12 +300,14 @@ pub async fn post_alert(
 ) -> ApiResult<Json<Value>> {
     let origin = auth.0.token.id;
     let store = app.store.clone();
-    let alert =
-        blocking(move || store.add_alert(body.ts, &body.kind, &body.payload, Some(origin))).await?;
+    let alert = blocking(move || {
+        store.add_alert(&body.client_id, body.ts, &body.kind, &body.payload, Some(origin))
+    })
+    .await?;
     // Fan out to every session except the origin token's.
     app.hub
         .broadcast_except(Event::Alert(alert.clone()), origin);
-    Ok(Json(json!({ "ok": true, "id": alert.id })))
+    Ok(Json(json!({ "ok": true, "id": alert.client_id })))
 }
 
 // ----- reads (RO or RW) ---------------------------------------------------
@@ -224,6 +323,35 @@ pub async fn get_series(
         blocking(move || store.get_samples(&fields, q.from, q.to, q.limit, q.cursor)).await?;
     let next = rows.last().map(|r| r.ts);
     Ok(Json(json!({ "rows": rows, "next_cursor": next })))
+}
+
+pub async fn get_meals(
+    State(app): State<AppState>,
+    _auth: Auth,
+    Query(q): Query<RangeQuery>,
+) -> ApiResult<Json<Value>> {
+    let store = app.store.clone();
+    let meals = blocking(move || store.get_meals(q.from, q.to)).await?;
+    Ok(Json(json!({ "meals": meals })))
+}
+
+pub async fn get_doses(
+    State(app): State<AppState>,
+    _auth: Auth,
+    Query(q): Query<RangeQuery>,
+) -> ApiResult<Json<Value>> {
+    let store = app.store.clone();
+    let doses = blocking(move || store.get_doses(q.from, q.to)).await?;
+    Ok(Json(json!({ "doses": doses })))
+}
+
+pub async fn get_basal_schedule(
+    State(app): State<AppState>,
+    _auth: Auth,
+) -> ApiResult<Json<Value>> {
+    let store = app.store.clone();
+    let schedule = blocking(move || store.get_basal_schedule()).await?;
+    Ok(Json(json!({ "basal_schedule": schedule })))
 }
 
 pub async fn get_predictions(
@@ -369,35 +497,33 @@ pub async fn get_model_file(
     Ok((headers, Body::from_stream(stream)).into_response())
 }
 
+/// Serve the most recent phone-pushed statistics block for `window`
+/// (`7d`/`30d`/`90d`, default `7d`) verbatim, or an all-zero block when the
+/// phone has pushed none. The server never computes or re-derives statistics.
 pub async fn get_stats(
     State(app): State<AppState>,
     _auth: Auth,
     Query(q): Query<StatsQuery>,
 ) -> ApiResult<Json<Value>> {
-    let window = match q.window {
-        Some(w) => StatsWindow::from_str(&w)?,
+    let window = match q.window.as_deref() {
+        Some(w) => StatsWindow::from_str(w)?,
         None => StatsWindow::D7,
     };
-    let fresh = q
-        .refresh
-        .as_deref()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
     let store = app.store.clone();
-    let stats = blocking(move || {
-        if fresh {
-            store.stats(window)
-        } else {
-            store.stats_cached(window)
-        }
-    })
-    .await?;
-    Ok(Json(json!({ "stats": stats })))
+    let raw = blocking(move || store.get_stats_block(window.as_str())).await?;
+    let block = match raw {
+        Some(txt) => serde_json::from_str::<Value>(&txt)
+            .unwrap_or_else(|_| serde_json::to_value(Stats::empty(window)).unwrap_or(Value::Null)),
+        None => serde_json::to_value(Stats::empty(window)).unwrap_or(Value::Null),
+    };
+    Ok(Json(json!({ "stats": block })))
 }
 
 /// Liveness plus a cheap system snapshot (memory, uptime, load) sampled via
 /// `sysinfo` on the blocking pool. Requires a live token (RO or RW) so host
-/// telemetry is never exposed to unauthenticated callers.
+/// telemetry is never exposed to unauthenticated callers. Carries the
+/// `store_epoch` marker so the phone can detect a freshly-wiped/new server and
+/// re-mirror its authoritative history (§3.8).
 pub async fn get_health(State(app): State<AppState>, _auth: Auth) -> Json<Value> {
     let system = tokio::task::spawn_blocking(|| {
         use sysinfo::System;
@@ -419,10 +545,17 @@ pub async fn get_health(State(app): State<AppState>, _auth: Auth) -> Json<Value>
     .await
     .unwrap_or(Value::Null);
 
+    let store = app.store.clone();
+    let store_epoch = tokio::task::spawn_blocking(move || store.store_epoch().ok().flatten())
+        .await
+        .ok()
+        .flatten();
+
     Json(json!({
         "status": "ok",
         "ws_clients": app.hub.receiver_count(),
         "time_ms": store::now_ms(),
+        "store_epoch": store_epoch,
         "system": system,
     }))
 }

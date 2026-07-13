@@ -5,17 +5,24 @@
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use t1dm_core::{Alert, Note, Photo, Prediction, SampleRow};
+use t1dm_core::{
+    Alert, BasalSchedule, DoseEvent, MealEvent, Note, Photo, PredictionEvent, SampleRow, StatsBlock,
+};
 
 /// Server→client push events, serialized as tagged JSON with a `"type"` key.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Event {
     Sample(SampleRow),
-    Prediction(Prediction),
+    Prediction(PredictionEvent),
     Note(Note),
     Photo(Photo),
     Alert(Alert),
+    Meal(MealEvent),
+    Dose(DoseEvent),
+    #[serde(rename = "basal_schedule")]
+    BasalSchedule(BasalSchedule),
+    Stats(StatsBlock),
 }
 
 /// An enveloped event carrying an optional token id to exclude from delivery

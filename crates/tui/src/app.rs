@@ -206,9 +206,11 @@ impl App {
         }
     }
 
-    /// Recompute the cached panel statistics if the refresh interval has
-    /// elapsed (or nothing is cached yet). Each window is a heavy parallel fold,
-    /// hence the throttle.
+    /// Refresh the cached panel statistics from the phone-pushed blocks (#6).
+    /// The server no longer computes statistics; it serves the most recent
+    /// per-window block the phone stored, verbatim. A window with no pushed
+    /// block, or a block that fails to parse, degrades to an all-zero
+    /// `Stats::empty`.
     fn refresh_stats(&mut self) {
         let due = self
             .last_stats_refresh
@@ -221,8 +223,11 @@ impl App {
         for (slot, &window) in out.iter_mut().zip(StatsWindow::ALL.iter()) {
             *slot = self
                 .store
-                .stats(window)
-                .unwrap_or_else(|_| Stats::empty(window));
+                .get_stats_block(window.as_str())
+                .ok()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<Stats>(&json).ok())
+                .unwrap_or_else(|| Stats::empty(window));
         }
         self.stats_cache = Some(out);
     }

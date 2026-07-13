@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::CoreError;
+use crate::events::Circadian;
 
 /// Prediction quantile levels, ascending. The `fan` matrix has one row per
 /// level in this exact order.
@@ -17,17 +18,16 @@ pub const MEDIAN_QUANTILE: usize = 3;
 /// Number of circadian time-of-day bins (2 hours each over 24h).
 pub const TOD_BINS: usize = 12;
 
-/// The nine scalar physiologic series that share the wide `samples` table.
+/// The six scalar physiologic series that share the wide `samples` table.
 ///
 /// Each maps to exactly one column; `column()` is the authoritative
 /// column-name mapping used by the store for generic per-series writes.
+/// Carbs, bolus, and basal are no longer scalar series — they are first-class
+/// curve events (`meal_event`/`dose_event`), so they do not appear here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Series {
     Bg,
-    Carbs,
-    Bolus,
-    Basal,
     Hr,
     Steps,
     Sleep,
@@ -37,11 +37,8 @@ pub enum Series {
 
 impl Series {
     /// All series in canonical column order.
-    pub const ALL: [Series; 9] = [
+    pub const ALL: [Series; 6] = [
         Series::Bg,
-        Series::Carbs,
-        Series::Bolus,
-        Series::Basal,
         Series::Hr,
         Series::Steps,
         Series::Sleep,
@@ -53,9 +50,6 @@ impl Series {
     pub fn column(self) -> &'static str {
         match self {
             Series::Bg => "bg",
-            Series::Carbs => "carbs",
-            Series::Bolus => "bolus",
-            Series::Basal => "basal",
             Series::Hr => "hr",
             Series::Steps => "steps",
             Series::Sleep => "sleep",
@@ -75,9 +69,6 @@ impl std::str::FromStr for Series {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "bg" => Series::Bg,
-            "carbs" => Series::Carbs,
-            "bolus" => Series::Bolus,
-            "basal" => Series::Basal,
             "hr" => Series::Hr,
             "steps" => Series::Steps,
             "sleep" => Series::Sleep,
@@ -95,41 +86,30 @@ impl std::fmt::Display for Series {
 }
 
 /// One wide row on the 5-minute grid. `ts` is the primary key (epoch ms,
-/// `ts % 300000 == 0`). Every physiologic field is optional; a gap is an
-/// explicit `None`/NULL. Total insulin (`bolus + basal`) is never stored —
-/// it is derived at display time.
+/// `ts % 300000 == 0`). Every physiologic scalar is optional; a gap is an
+/// explicit `None`/NULL. `updated_at` is the phone clock, stored verbatim;
+/// `received_at` is the server's internal arrival stamp and never crosses the
+/// wire (`#[serde(skip)]`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SampleRow {
     pub ts: i64,
     pub tz_offset: i32,
     pub bg: Option<f64>,
-    pub carbs: Option<f64>,
-    pub bolus: Option<f64>,
-    pub basal: Option<f64>,
     pub hr: Option<f64>,
     pub steps: Option<f64>,
     pub sleep: Option<f64>,
     pub exercise: Option<f64>,
     pub mood: Option<i64>,
     pub updated_at: i64,
+    #[serde(skip)]
+    pub received_at: i64,
 }
 
 impl SampleRow {
-    /// Display-derived total insulin (bolus + basal), None when both absent.
-    pub fn total_insulin(&self) -> Option<f64> {
-        match (self.bolus, self.basal) {
-            (None, None) => None,
-            (b, s) => Some(b.unwrap_or(0.0) + s.unwrap_or(0.0)),
-        }
-    }
-
     /// Read one series column as an f64 (mood widened).
     pub fn get(&self, series: Series) -> Option<f64> {
         match series {
             Series::Bg => self.bg,
-            Series::Carbs => self.carbs,
-            Series::Bolus => self.bolus,
-            Series::Basal => self.basal,
             Series::Hr => self.hr,
             Series::Steps => self.steps,
             Series::Sleep => self.sleep,
@@ -142,9 +122,6 @@ impl SampleRow {
     pub fn set(&mut self, series: Series, value: Option<f64>) {
         match series {
             Series::Bg => self.bg = value,
-            Series::Carbs => self.carbs = value,
-            Series::Bolus => self.bolus = value,
-            Series::Basal => self.basal = value,
             Series::Hr => self.hr = value,
             Series::Steps => self.steps = value,
             Series::Sleep => self.sleep = value,
@@ -154,47 +131,36 @@ impl SampleRow {
     }
 }
 
-/// A model forecast: the median line plus a quantile fan, and a circadian
-/// (time-of-day) distribution with a confidence scalar.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Prediction {
-    pub id: i64,
+/// A model forecast served on `GET /v1/predictions`: the median line, a
+/// quantile fan, and the optional circadian belief. `made_at` is the phone's
+/// cycle timestamp, stored verbatim; the server-internal `id`/`created_at`
+/// never cross the wire, so this read shape omits them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct PredictionEvent {
     pub made_at: i64,
     pub model_id: String,
+    pub updated_at: i64,
     pub horizon_steps: i32,
     /// Predicted median series, length `horizon_steps` (mg/dL).
     pub line: Vec<f64>,
     /// Quantile fan: 7 rows (one per [`QUANTILE_LEVELS`]) × `horizon_steps`.
     pub fan: Vec<Vec<f64>>,
-    /// Circadian distribution over 12 two-hour bins (units: hours).
-    pub tod: Vec<f64>,
-    pub tod_conf: f64,
-    pub created_at: i64,
+    /// Circadian belief from the model's time head; explicit `null` when the
+    /// model has no time head.
+    pub circadian: Option<Circadian>,
 }
 
-impl Default for Prediction {
-    fn default() -> Self {
-        Prediction {
-            id: 0,
-            made_at: 0,
-            model_id: String::new(),
-            horizon_steps: 0,
-            line: Vec::new(),
-            fan: Vec::new(),
-            tod: vec![0.0; TOD_BINS],
-            tod_conf: 0.0,
-            created_at: 0,
-        }
-    }
-}
-
-/// A free-text note pinned to a grid timestamp.
+/// A free-text note pinned to a grid timestamp, keyed by the phone's
+/// `client_id`. `updated_at` is the phone clock, stored verbatim; a phone-side
+/// edit carries a newer `updated_at`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Note {
     pub id: i64,
+    pub client_id: String,
     pub ts: i64,
     pub tz_offset: i32,
     pub text: String,
+    pub updated_at: i64,
     pub created_at: i64,
 }
 
@@ -212,11 +178,13 @@ pub struct Photo {
     pub created_at: i64,
 }
 
-/// An application-originated alert. `payload` is opaque JSON; `origin_token`
-/// is the minting caller's token id, excluded from broadcast fan-out.
+/// An application-originated alert, keyed by the phone's `client_id`. `payload`
+/// is opaque JSON; `origin_token` is the minting caller's token id, excluded
+/// from broadcast fan-out. Immutable once written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Alert {
     pub id: i64,
+    pub client_id: String,
     pub ts: i64,
     pub kind: String,
     pub payload: Value,
@@ -228,11 +196,33 @@ impl Default for Alert {
     fn default() -> Self {
         Alert {
             id: 0,
+            client_id: String::new(),
             ts: 0,
             kind: String::new(),
             payload: Value::Null,
             origin_token: None,
             created_at: 0,
+        }
+    }
+}
+
+/// A phone-pushed statistics block for one window (`7d`/`30d`/`90d`), stored
+/// and served verbatim. `json` is the opaque phone `Stats` block echoed
+/// byte-for-byte — the server never computes or re-derives it. `window` is the
+/// primary key; the server-internal `received_at` never crosses the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatsBlock {
+    pub window: String,
+    pub updated_at: i64,
+    pub json: Value,
+}
+
+impl Default for StatsBlock {
+    fn default() -> Self {
+        StatsBlock {
+            window: String::new(),
+            updated_at: 0,
+            json: Value::Null,
         }
     }
 }

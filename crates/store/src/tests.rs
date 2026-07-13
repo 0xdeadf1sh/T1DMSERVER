@@ -1,6 +1,7 @@
 //! Store unit/integration tests: migrations, the `one_rw` token invariant,
-//! ingest→read roundtrips, and the statistics reduction. Each test runs
-//! against a throwaway store rooted in a unique temp directory.
+//! six-scalar ingest→read roundtrips, the first-class meal/dose/basal-schedule
+//! curve events, phone-pushed stats blocks, and the `store_epoch` identity.
+//! Each test runs against a throwaway store rooted in a unique temp directory.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,11 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::json;
 
 use t1dm_core::{
-    IngestBundle, IngestPrediction, SampleRow, Series, SeriesPoint, StatsWindow, TokenKind, GRID_MS,
+    BasalSchedule, BasalSlot, DoseEvent, DoseKind, IngestBundle, MealEvent, Series, TokenKind,
+    GRID_MS,
 };
 
 use crate::schema::LATEST_VERSION;
-use crate::stats::compute;
 use crate::{FakeOpts, FakeRange, Store};
 
 /// A store rooted in a fresh temp dir, wiped on drop.
@@ -88,10 +89,15 @@ fn migrations_apply_once_and_are_idempotent() {
         .unwrap();
     assert_eq!(count, LATEST_VERSION);
 
-    // Every core table is present and queryable.
+    // Every core table is present and queryable. `meta` is excluded: it may
+    // legitimately hold the minted `store_epoch` row (see the store_epoch test).
     for tbl in [
         "samples",
+        "meal_event",
+        "dose_event",
+        "basal_schedule_dose",
         "prediction",
+        "stats_block",
         "note",
         "photo",
         "alert",
@@ -159,30 +165,24 @@ fn minting_rw_upholds_one_rw_invariant() {
     assert!(ts.revoke_token(9_999).is_err());
 }
 
-// -------------------------------------------------------- ingest ↔ read
+// ---------------------------------------------------- six-scalar ingest ↔ read
 
 #[test]
-fn ingest_bundle_roundtrips_and_rejects_off_grid() {
+fn ingest_bundle_roundtrips_coalesces_and_rejects_off_grid() {
     let ts = TempStore::new();
     let t = grid_ts(0);
 
+    // Six demoted scalars only — carbs/bolus/basal are first-class curve events
+    // now, and predictions/notes have their own endpoints. `updated_at` is the
+    // phone clock, stored verbatim.
     let bundle = IngestBundle {
         ts: t,
         tz_offset: -300,
+        updated_at: 1_000,
         bg: Some(123.5),
-        carbs: Some(40.0),
-        bolus: Some(4.0),
-        basal: Some(0.8),
         hr: Some(72.0),
-        prediction: Some(IngestPrediction {
-            model_id: "m1".into(),
-            horizon_steps: 3,
-            line: vec![120.0, 125.0, 130.0],
-            fan: vec![vec![110.0, 112.0, 114.0]; 7],
-            tod: vec![1.0; 12],
-            tod_conf: 0.8,
-        }),
-        notes: vec!["breakfast".into()],
+        steps: Some(410.0),
+        mood: Some(4),
         ..Default::default()
     };
     ts.ingest_bundle(&bundle).unwrap();
@@ -194,21 +194,24 @@ fn ingest_bundle_roundtrips_and_rejects_off_grid() {
     let r = &rows[0];
     assert_eq!(r.ts, t);
     assert_eq!(r.tz_offset, -300);
+    assert_eq!(r.updated_at, 1_000, "phone clock stored verbatim");
     approx(r.bg.unwrap(), 123.5);
-    approx(r.carbs.unwrap(), 40.0);
-    approx(r.total_insulin().unwrap(), 4.8);
-    assert!(r.steps.is_none(), "absent field stays NULL");
+    approx(r.hr.unwrap(), 72.0);
+    approx(r.steps.unwrap(), 410.0);
+    assert_eq!(r.mood, Some(4));
+    assert!(
+        r.sleep.is_none() && r.exercise.is_none(),
+        "absent fields stay NULL"
+    );
+    // `received_at` is the server's internal arrival stamp: populated on read,
+    // never serialized onto the wire (`#[serde(skip)]`).
+    assert!(r.received_at > 0, "server arrival stamp is set internally");
 
-    // Embedded prediction and note are written in the same transaction.
-    let latest = ts.get_prediction_latest().unwrap().expect("prediction");
-    assert_eq!(latest.model_id, "m1");
-    assert_eq!(latest.made_at, t);
-    approx(latest.line[1], 125.0);
-    assert_eq!(ts.get_notes(None, None).unwrap().len(), 1);
-
-    // A second ingest with only HR present coalesces onto the existing row.
+    // A later partial fill (HR only, newer `updated_at`) coalesces onto the
+    // existing row: present columns survive via COALESCE, `updated_at` advances.
     let patch = IngestBundle {
         ts: t,
+        updated_at: 2_000,
         hr: Some(80.0),
         ..Default::default()
     };
@@ -218,10 +221,30 @@ fn ingest_bundle_roundtrips_and_rejects_off_grid() {
         .unwrap()[0];
     approx(r2.hr.unwrap(), 80.0);
     approx(r2.bg.unwrap(), 123.5);
+    assert_eq!(r2.updated_at, 2_000);
+
+    // Idempotency: a stale redelivery (older `updated_at`) is a no-op — the
+    // `excluded.updated_at >= samples.updated_at` guard rejects it, so neither
+    // the value nor `updated_at` regresses. The `ts` primary key keeps the row
+    // count at one throughout (no duplicate bucket).
+    let stale = IngestBundle {
+        ts: t,
+        updated_at: 1_500,
+        hr: Some(999.0),
+        ..Default::default()
+    };
+    ts.ingest_bundle(&stale).unwrap();
+    let r3 = ts
+        .get_samples(&Series::ALL, None, None, None, None)
+        .unwrap();
+    assert_eq!(r3.len(), 1, "one bucket, no duplicate");
+    approx(r3[0].hr.unwrap(), 80.0);
+    assert_eq!(r3[0].updated_at, 2_000);
 
     // Off-grid timestamps are refused.
     let bad = IngestBundle {
         ts: t + 1,
+        updated_at: 3_000,
         ..Default::default()
     };
     assert!(matches!(
@@ -231,31 +254,19 @@ fn ingest_bundle_roundtrips_and_rejects_off_grid() {
 }
 
 #[test]
-fn series_upsert_and_cursor_pagination() {
+fn ingest_cursor_pagination_and_mood_column() {
     let ts = TempStore::new();
-    let points: Vec<SeriesPoint> = (0..5)
-        .map(|i| SeriesPoint {
+    for i in 0..5 {
+        ts.ingest_bundle(&IngestBundle {
             ts: grid_ts(i),
-            value: 100.0 + i as f64,
+            tz_offset: 0,
+            updated_at: 1_000 + i,
+            bg: Some(100.0 + i as f64),
+            mood: Some(3),
+            ..Default::default()
         })
-        .collect();
-    let n = ts.upsert_samples(Series::Bg, &points).unwrap();
-    assert_eq!(n, 5);
-
-    // Override in place (backfill semantics): hard-overwrite one column.
-    ts.upsert_samples(
-        Series::Bg,
-        &[SeriesPoint {
-            ts: grid_ts(2),
-            value: 999.0,
-        }],
-    )
-    .unwrap();
-    let all = ts
-        .get_samples(&[Series::Bg], None, None, None, None)
         .unwrap();
-    assert_eq!(all.len(), 5);
-    approx(all[2].bg.unwrap(), 999.0);
+    }
 
     // Forward cursor pagination skips rows with ts <= cursor.
     let page = ts
@@ -264,112 +275,345 @@ fn series_upsert_and_cursor_pagination() {
     assert_eq!(page.len(), 2);
     assert_eq!(page[0].ts, grid_ts(2));
     assert_eq!(page[1].ts, grid_ts(3));
+    approx(page[0].bg.unwrap(), 102.0);
 
-    // Integer series truncates to i64.
-    ts.upsert_samples(
-        Series::Mood,
-        &[SeriesPoint {
-            ts: grid_ts(0),
-            value: 4.7,
-        }],
-    )
-    .unwrap();
+    // Mood is the one integer-valued scalar and round-trips as an i64.
     let row0 = &ts
-        .get_samples(
-            &[Series::Mood],
-            Some(grid_ts(0)),
-            Some(grid_ts(0)),
-            None,
-            None,
-        )
+        .get_samples(&[Series::Mood], Some(grid_ts(0)), Some(grid_ts(0)), None, None)
         .unwrap()[0];
-    assert_eq!(row0.mood, Some(4));
+    assert_eq!(row0.mood, Some(3));
 }
 
-// -------------------------------------------------------------- statistics
-
-fn bg_hr_row(ts: i64, bg: f64, hr: f64) -> SampleRow {
-    SampleRow {
-        ts,
-        bg: Some(bg),
-        hr: Some(hr),
-        ..Default::default()
-    }
-}
+// --------------------------------------------------------- meal curve events
 
 #[test]
-fn compute_reduces_window_metrics() {
-    // Four samples: one hypo, two in-range, one hyper.
-    let mut rows = vec![
-        bg_hr_row(grid_ts(0), 50.0, 60.0),
-        bg_hr_row(grid_ts(1), 100.0, 70.0),
-        bg_hr_row(grid_ts(2), 200.0, 90.0),
-        bg_hr_row(grid_ts(3), 100.0, 70.0),
-    ];
-    // hr = 50 + 0.2*bg exactly, so BG↔HR correlation is +1.
-    rows[1].carbs = Some(30.0);
-    rows[3].carbs = Some(20.0);
-    rows[1].bolus = Some(3.0);
-    rows[3].bolus = Some(2.0);
-    for r in &mut rows {
-        r.basal = Some(2.5);
-    }
-
-    let s = compute(StatsWindow::D7, &rows);
-    approx(s.mean_bg, 112.5);
-    approx(s.tir, 0.5);
-    approx(s.time_below, 0.25);
-    approx(s.time_above, 0.25);
-    assert_eq!(s.n_samples, 4);
-
-    // sd² = mean of squared deviations about 112.5.
-    approx(s.sd, 2968.75_f64.sqrt());
-    approx(s.cv, s.sd / 112.5 * 100.0);
-    approx(s.gmi, 3.31 + 0.02392 * 112.5);
-
-    // One contiguous hypo run and one hyper run, each a single 5-min sample.
-    assert_eq!(s.hypo_events.count, 1);
-    assert_eq!(s.hypo_events.duration_ms, GRID_MS);
-    assert_eq!(s.hyper_events.count, 1);
-    assert_eq!(s.hyper_events.duration_ms, GRID_MS);
-
-    // Daily aggregates: totals divided by the 7-day window span.
-    approx(s.mean_daily_carbs, 50.0 / 7.0);
-    approx(s.tdd, 15.0 / 7.0); // (3+2) bolus + (4×2.5) basal, per day over 7d
-    approx(s.bolus_basal_ratio, 0.5);
-    approx(s.mean_hr, 72.5);
-    approx(s.bg_hr_corr, 1.0);
-
-    // No BG at all → the empty block.
-    let none = compute(
-        StatsWindow::D7,
-        &[SampleRow {
-            ts: grid_ts(9),
-            ..Default::default()
-        }],
-    );
-    assert_eq!(none.n_samples, 0);
-    approx(none.tir, 0.0);
-}
-
-#[test]
-fn stats_over_store_is_bounded() {
+fn meal_event_roundtrips_and_upserts_on_newer() {
     let ts = TempStore::new();
-    assert_eq!(ts.stats(StatsWindow::D7).unwrap().n_samples, 0);
 
+    // A parametric meal: gamma params, no resolved curve.
+    let m = MealEvent {
+        client_id: "meal-abc".into(),
+        ts: grid_ts(1),
+        tz_offset: -300,
+        updated_at: 1_000,
+        grams: 60.0,
+        duration_min: 180.0,
+        gi: Some(0.75),
+        k: Some(2.0),
+        theta: Some(20.0),
+        custom_curve: None,
+        note: Some("breakfast".into()),
+    };
+    let out = ts.put_meals(std::slice::from_ref(&m)).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0], m, "the canonical row echoes the input verbatim");
+
+    // Readable by range and by phone `client_id`.
+    assert_eq!(ts.get_meals(None, None).unwrap(), vec![m.clone()]);
+    assert_eq!(ts.get_meal("meal-abc").unwrap(), Some(m.clone()));
+
+    // A mixed/builder meal is stored only as its resolved appearance curve —
+    // there is no per-component breakdown.
+    let mixed = MealEvent {
+        client_id: "meal-mix".into(),
+        ts: grid_ts(2),
+        tz_offset: 0,
+        updated_at: 1_000,
+        grams: 45.0,
+        duration_min: 120.0,
+        gi: None,
+        k: None,
+        theta: None,
+        custom_curve: Some(vec![0.0, 1.5, 3.0, 2.0, 0.5]),
+        note: None,
+    };
+    ts.put_meals(std::slice::from_ref(&mixed)).unwrap();
+    assert_eq!(
+        ts.get_meal("meal-mix").unwrap().unwrap().custom_curve,
+        mixed.custom_curve,
+        "the resolved curve round-trips through the JSON column"
+    );
+
+    // Idempotency: a redelivery (equal `updated_at`) is a no-op — no duplicate.
+    ts.put_meals(std::slice::from_ref(&m)).unwrap();
+    assert_eq!(ts.get_meals(None, None).unwrap().len(), 2, "no duplicate row");
+
+    // A reordered stale redelivery (older `updated_at`) is rejected in place.
+    let stale = MealEvent {
+        grams: 999.0,
+        updated_at: 500,
+        ..m.clone()
+    };
+    ts.put_meals(std::slice::from_ref(&stale)).unwrap();
+    approx(ts.get_meal("meal-abc").unwrap().unwrap().grams, 60.0);
+
+    // A genuine phone-side edit (newer `updated_at`) replaces in place.
+    let edited = MealEvent {
+        grams: 75.0,
+        updated_at: 2_000,
+        note: Some("bigger".into()),
+        ..m.clone()
+    };
+    let echoed = ts.put_meals(std::slice::from_ref(&edited)).unwrap();
+    approx(echoed[0].grams, 75.0);
+    let got = ts.get_meal("meal-abc").unwrap().unwrap();
+    approx(got.grams, 75.0);
+    assert_eq!(got.updated_at, 2_000);
+    assert_eq!(got.note.as_deref(), Some("bigger"));
+}
+
+// --------------------------------------------------------- dose curve events
+
+#[test]
+fn dose_event_roundtrips_bolus_and_basal_and_upserts_on_newer() {
+    let ts = TempStore::new();
+
+    // A bolus carries gamma params; a basal carries Bateman ka/ke params.
+    let bolus = DoseEvent {
+        client_id: "dose-bolus".into(),
+        ts: grid_ts(1),
+        tz_offset: 0,
+        updated_at: 1_000,
+        kind: DoseKind::Bolus,
+        units: 4.5,
+        duration_min: 240.0,
+        k: Some(2.0),
+        theta: Some(25.0),
+        ka_per_hour: None,
+        ke_per_hour: None,
+        custom_curve: None,
+        note: None,
+    };
+    let basal = DoseEvent {
+        client_id: "dose-basal".into(),
+        ts: grid_ts(2),
+        tz_offset: 0,
+        updated_at: 1_000,
+        kind: DoseKind::Basal,
+        units: 12.0,
+        duration_min: 1440.0,
+        k: None,
+        theta: None,
+        ka_per_hour: Some(1.0),
+        ke_per_hour: Some(0.5),
+        custom_curve: None,
+        note: Some("overnight".into()),
+    };
+
+    let out = ts.put_doses(&[bolus.clone(), basal.clone()]).unwrap();
+    assert_eq!(
+        out,
+        vec![bolus.clone(), basal.clone()],
+        "canonical rows echo the inputs in request order"
+    );
+
+    // The dose kind survives the text round-trip through the CHECK column.
+    assert_eq!(
+        ts.get_dose("dose-bolus").unwrap().unwrap().kind,
+        DoseKind::Bolus
+    );
+    assert_eq!(
+        ts.get_dose("dose-basal").unwrap().unwrap().kind,
+        DoseKind::Basal
+    );
+    assert_eq!(
+        ts.get_doses(None, None).unwrap(),
+        vec![bolus.clone(), basal.clone()]
+    );
+
+    // Redelivery (equal `updated_at`) is a no-op; no duplicate rows.
+    ts.put_doses(std::slice::from_ref(&bolus)).unwrap();
+    assert_eq!(ts.get_doses(None, None).unwrap().len(), 2);
+
+    // Stale (older `updated_at`) rejected; newer replaces in place.
+    let stale = DoseEvent {
+        units: 99.0,
+        updated_at: 500,
+        ..bolus.clone()
+    };
+    ts.put_doses(std::slice::from_ref(&stale)).unwrap();
+    approx(ts.get_dose("dose-bolus").unwrap().unwrap().units, 4.5);
+
+    let edited = DoseEvent {
+        units: 6.0,
+        updated_at: 2_000,
+        ..bolus.clone()
+    };
+    ts.put_doses(std::slice::from_ref(&edited)).unwrap();
+    let got = ts.get_dose("dose-bolus").unwrap().unwrap();
+    approx(got.units, 6.0);
+    assert_eq!(got.updated_at, 2_000);
+}
+
+// ------------------------------------------------------ basal schedule replace
+
+#[test]
+fn basal_schedule_full_replace_keeps_one_active() {
+    let ts = TempStore::new();
+    assert!(ts.get_basal_schedule().unwrap().is_none());
+
+    let slot = |cid: &str, tod: i32, dose: f64| BasalSlot {
+        client_id: cid.into(),
+        label: format!("slot-{tod}"),
+        time_of_day_min: tod,
+        dose_u: dose,
+        duration_min: 180.0,
+        ka_per_hour: 1.0,
+        ke_per_hour: 0.4,
+        tz_offset: 0,
+        updated_at: 1_000,
+    };
+
+    let sched = BasalSchedule {
+        schedule_id: "sched-A".into(),
+        active: true,
+        slots: vec![slot("a1", 360, 0.8), slot("a2", 720, 1.0)],
+    };
+    let stored = ts.put_basal_schedule(&sched).unwrap();
+    assert_eq!(stored.schedule_id, "sched-A");
+    assert!(stored.active);
+    // Slots come back ordered by `time_of_day_min`.
+    assert_eq!(stored.slots.len(), 2);
+    assert_eq!(stored.slots[0].client_id, "a1");
+    assert_eq!(stored.slots[1].client_id, "a2");
+
+    let live = ts.get_basal_schedule().unwrap().unwrap();
+    assert_eq!(live.schedule_id, "sched-A");
+    assert_eq!(live.slots.len(), 2);
+
+    // A full-replace with fewer slots drops the omitted one (a true replace),
+    // while the surviving slot's edit needs a newer `updated_at` to land.
+    let a1_edit = BasalSlot {
+        updated_at: 2_000,
+        ..slot("a1", 360, 0.9)
+    };
+    let shrunk = BasalSchedule {
+        schedule_id: "sched-A".into(),
+        active: true,
+        slots: vec![a1_edit],
+    };
+    let after = ts.put_basal_schedule(&shrunk).unwrap();
+    assert_eq!(after.slots.len(), 1, "the omitted slot is dropped");
+    assert_eq!(after.slots[0].client_id, "a1");
+    approx(after.slots[0].dose_u, 0.9);
+
+    // Activating a second schedule retires the first — exactly one stays live.
+    let sched_b = BasalSchedule {
+        schedule_id: "sched-B".into(),
+        active: true,
+        slots: vec![slot("b1", 300, 0.5)],
+    };
+    ts.put_basal_schedule(&sched_b).unwrap();
+    let live2 = ts.get_basal_schedule().unwrap().unwrap();
+    assert_eq!(
+        live2.schedule_id, "sched-B",
+        "only the newest activation is live"
+    );
+    assert_eq!(live2.slots.len(), 1);
+}
+
+// ------------------------------------------------------- phone-pushed stats
+
+#[test]
+fn stats_block_roundtrips_verbatim_and_upserts_on_newer() {
+    let ts = TempStore::new();
+    assert!(ts.get_stats_block("7d").unwrap().is_none());
+
+    // The server stores the phone's block byte-for-byte and never re-derives it.
+    let block = json!({
+        "window": "7d",
+        "tir": 0.72,
+        "time_below": 0.05,
+        "time_above": 0.23,
+        "mean_bg": 141.0,
+        "n_samples": 288
+    })
+    .to_string();
+    ts.put_stats_block("7d", &block, 1_000).unwrap();
+    assert_eq!(
+        ts.get_stats_block("7d").unwrap().as_deref(),
+        Some(block.as_str())
+    );
+
+    // A distinct window is stored independently and leaves 7d untouched.
+    let block90 = json!({"window":"90d","tir":0.66}).to_string();
+    ts.put_stats_block("90d", &block90, 1_000).unwrap();
+    assert_eq!(
+        ts.get_stats_block("90d").unwrap().as_deref(),
+        Some(block90.as_str())
+    );
+    assert_eq!(
+        ts.get_stats_block("7d").unwrap().as_deref(),
+        Some(block.as_str())
+    );
+
+    // Idempotency: a redelivery (equal `updated_at`) is a no-op even with a
+    // different body; a stale one is likewise rejected.
+    let other = json!({"window":"7d","tir":0.0}).to_string();
+    ts.put_stats_block("7d", &other, 1_000).unwrap();
+    assert_eq!(
+        ts.get_stats_block("7d").unwrap().as_deref(),
+        Some(block.as_str())
+    );
+    ts.put_stats_block("7d", &other, 500).unwrap();
+    assert_eq!(
+        ts.get_stats_block("7d").unwrap().as_deref(),
+        Some(block.as_str())
+    );
+
+    // A newer `updated_at` replaces the block verbatim.
+    let newer = json!({"window":"7d","tir":0.80,"n_samples":300}).to_string();
+    ts.put_stats_block("7d", &newer, 2_000).unwrap();
+    assert_eq!(
+        ts.get_stats_block("7d").unwrap().as_deref(),
+        Some(newer.as_str())
+    );
+}
+
+// ------------------------------------------------------------- store_epoch
+
+#[test]
+fn store_epoch_is_minted_once_and_refreshes_on_wipe() {
+    let ts = TempStore::new();
+
+    // Minting is idempotent: one stable identity per store.
+    let e1 = ts.ensure_store_epoch().unwrap();
+    assert!(!e1.is_empty());
+    assert_eq!(ts.ensure_store_epoch().unwrap(), e1, "idempotent mint");
+    assert_eq!(ts.store_epoch().unwrap().as_deref(), Some(e1.as_str()));
+
+    // Persisted in `meta`: reopening the same data dir recovers the same epoch.
+    {
+        let reopened = Store::open_at(&ts.dir).unwrap();
+        assert_eq!(reopened.store_epoch().unwrap(), Some(e1.clone()));
+    }
+
+    // A teardown wipes `meta`, so the next mint yields a fresh, distinct
+    // identity — the signal the phone uses to trigger a full re-mirror (§3.8).
+    ts.teardown().unwrap();
+    let e2 = ts.ensure_store_epoch().unwrap();
+    assert_ne!(e2, e1, "a wiped store is a new identity");
+}
+
+// ------------------------------------------------------ synthetic generator
+
+#[test]
+fn generate_fake_writes_scalar_samples_and_predictions() {
+    let ts = TempStore::new();
     let written = ts
         .generate_fake(FakeRange::last_days(1), FakeOpts::default())
         .unwrap();
     assert!(written > 200, "≈288 grid rows over a day, got {written}");
 
-    let s = ts.stats(StatsWindow::D7).unwrap();
-    assert!(s.n_samples > 0);
-    assert!((0.0..=1.0).contains(&s.tir));
-    assert!((0.0..=1.0).contains(&(s.tir + s.time_below + s.time_above)));
-    assert!(s.mean_bg >= 40.0 && s.mean_bg <= 400.0);
-    assert!((-1.0..=1.0).contains(&s.bg_hr_corr));
+    let rows = ts
+        .get_samples(&Series::ALL, None, None, None, None)
+        .unwrap();
+    assert_eq!(rows.len(), written, "one row per generated grid step");
+    // Every generated row sits on the grid and carries the scalar BG series.
+    assert!(rows.iter().all(|r| t1dm_core::on_grid(r.ts)));
+    assert!(rows.iter().all(|r| r.bg.is_some()));
 
-    // The synthetic generator also emits predictions.
+    // The synthetic generator also emits forecasts.
     assert!(ts.get_prediction_latest().unwrap().is_some());
 }
 

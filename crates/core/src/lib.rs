@@ -1,14 +1,16 @@
 //! t1dm-core — shared domain contract for T1DMSERVER.
 //!
 //! These types are the cross-crate contract locked by the Foundation.
-//! Everything physiologic lives on a fixed 5-minute epoch-ms grid; storage
-//! units are fixed — BG in mg/dL, and carbs/bolus/basal as the grams/units
-//! ingested or delivered within each 5-minute bucket — and display conversion
-//! is a pure function here.
+//! Everything physiologic lives on a fixed 5-minute epoch-ms grid; sample
+//! storage is scalar (BG in mg/dL plus HR, steps, sleep, exercise, mood),
+//! while meals and doses are self-describing curves keyed by phone
+//! `client_id`, and display conversion is a pure function here.
 
 pub mod config;
+pub mod curve;
 pub mod domain;
 pub mod error;
+pub mod events;
 pub mod ingest;
 pub mod stats;
 pub mod units;
@@ -17,11 +19,14 @@ pub use config::{
     BackupConfig, Config, LogConfig, QrConfig, ServerConfig, StorageConfig, UiConfig,
 };
 pub use domain::{
-    Alert, Model, Note, Photo, Prediction, SampleRow, Series, Session, Token, TokenKind,
-    QUANTILE_LEVELS, TOD_BINS,
+    Alert, Model, Note, Photo, PredictionEvent, SampleRow, Series, Session, StatsBlock, Token,
+    TokenKind, QUANTILE_LEVELS, TOD_BINS,
 };
 pub use error::{CoreError, Result};
-pub use ingest::{IngestBundle, IngestPrediction, QrPayload, SeriesPoint, SeriesUpsert};
+pub use events::{
+    BasalSchedule, BasalSlot, Circadian, DoseEvent, DoseKind, MealEvent, PredictionWrite,
+};
+pub use ingest::{IngestBundle, QrPayload};
 pub use stats::{Stats, StatsWindow};
 pub use units::{BgUnit, MGDL_PER_MMOL};
 

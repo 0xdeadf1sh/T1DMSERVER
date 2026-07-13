@@ -60,7 +60,7 @@ pub struct EventStat {
 }
 
 /// Full statistics for one window. All BG figures in mg/dL; time-in-range
-/// fractions are 0..=1. Recomputed on ingest, cached in the store.
+/// fractions are 0..=1. Computed on the phone and stored by the server verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Stats {
     pub window: StatsWindow,

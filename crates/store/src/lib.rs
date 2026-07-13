@@ -6,9 +6,11 @@
 //! may be minimal but are never panics.
 
 mod error;
+mod events;
 mod fake;
 mod models;
 mod reads;
+mod reconstruct;
 mod schema;
 mod stats;
 mod tokens;
@@ -19,7 +21,7 @@ mod tests;
 
 pub use error::{Result, StoreError};
 pub use fake::{FakeOpts, FakeRange};
-pub use stats::STATS_CACHE_TTL_MS;
+pub use reconstruct::ReconstructedChannels;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -83,13 +85,17 @@ impl Store {
             .with_init(|c| c.execute_batch(schema::CONNECTION_PRAGMAS));
         let pool = Pool::builder().max_size(8).build(manager)?;
 
-        Ok(Store {
+        let store = Store {
             inner: Arc::new(StoreInner {
                 writer: Mutex::new(writer),
                 pool,
                 data_dir: data_dir.to_path_buf(),
             }),
-        })
+        };
+        // Mint the re-mirror epoch on a freshly-created schema (idempotent on an
+        // existing one), so `GET /v1/health` can surface it (§3.8, H7).
+        store.ensure_store_epoch()?;
+        Ok(store)
     }
 
     /// Root data directory.
@@ -139,6 +145,10 @@ impl Store {
             schema::migrate(c)?;
             Ok(())
         })?;
+
+        // teardown() dropped `meta`, so re-mint a fresh `store_epoch`: the phone
+        // must see a new epoch after a wipe and re-mirror its history (§3.8).
+        self.ensure_store_epoch()?;
 
         let photos = self.photos_dir();
         if photos.exists() {

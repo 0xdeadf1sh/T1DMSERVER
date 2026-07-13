@@ -2,6 +2,7 @@
 //! scrollable. Columns adapt to the available width; BG cells are tinted by
 //! range. Values are shown in the active display unit for BG.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyEvent, MouseEvent};
@@ -29,6 +30,13 @@ const WIDE_MIN: u16 = 74;
 pub struct DataPane {
     scroll: ScrollState,
     rows: Vec<SampleRow>,
+    /// Per-bucket reconstructed carb-appearance / bolus / basal, keyed by grid
+    /// ts. Carbs/bolus/basal are no longer sample columns; the store folds them
+    /// from the stored meal/dose curve events (display-only; the §4-#6 basal
+    /// XOR is applied inside `reconstruct_channels`).
+    carb: HashMap<i64, f64>,
+    bolus: HashMap<i64, f64>,
+    basal: HashMap<i64, f64>,
     last_fetch: Option<Instant>,
     err: Option<String>,
 }
@@ -58,6 +66,20 @@ impl DataPane {
             }
             Err(e) => self.err = Some(e.to_string()),
         }
+
+        // Carbs/bolus/basal are no longer sample columns — the store folds them
+        // back from the stored meal/dose curve events onto the same 5-minute
+        // grid the rows sit on (display-only; not part of any dosing guarantee).
+        // Key each channel's (ts, value) points by grid ts for per-row lookup; a
+        // reconstruction error degrades to empty channels (dim dots) rather than
+        // blanking the sample table.
+        let channels = ctx
+            .store
+            .reconstruct_channels(from, ctx.now_ms)
+            .unwrap_or_default();
+        self.carb = channels.carb.into_iter().collect();
+        self.bolus = channels.bolus.into_iter().collect();
+        self.basal = channels.basal.into_iter().collect();
     }
 }
 
@@ -149,18 +171,25 @@ impl PaneView for DataPane {
                 Span::styled(format!("{time:<16}"), Style::default().fg(pal.fg)),
                 Span::styled(format!("{bg_txt:>7}"), bg_style),
             ];
+            let carb = chan_at(&self.carb, row.ts);
             if wide {
-                spans.push(cell(row.carbs, 7, 0, pal.fg, pal.dim));
-                spans.push(cell(row.bolus, 7, 1, pal.secondary, pal.dim));
-                spans.push(cell(row.basal, 7, 2, pal.secondary, pal.dim));
+                spans.push(cell(carb, 7, 0, pal.fg, pal.dim));
+                spans.push(cell(chan_at(&self.bolus, row.ts), 7, 1, pal.secondary, pal.dim));
+                spans.push(cell(chan_at(&self.basal, row.ts), 7, 2, pal.secondary, pal.dim));
                 spans.push(cell(row.hr, 6, 0, pal.accent, pal.dim));
                 spans.push(cell(row.steps, 7, 0, pal.fg, pal.dim));
                 spans.push(cell(row.sleep, 5, 0, pal.fg, pal.dim));
                 spans.push(cell(row.exercise, 5, 0, pal.fg, pal.dim));
                 spans.push(cell(row.mood.map(|m| m as f64), 5, 0, pal.fg, pal.dim));
             } else {
-                spans.push(cell(row.carbs, 7, 0, pal.fg, pal.dim));
-                spans.push(cell(row.total_insulin(), 7, 1, pal.secondary, pal.dim));
+                spans.push(cell(carb, 7, 0, pal.fg, pal.dim));
+                spans.push(cell(
+                    total_insulin_at(&self.bolus, &self.basal, row.ts),
+                    7,
+                    1,
+                    pal.secondary,
+                    pal.dim,
+                ));
                 spans.push(cell(row.hr, 6, 0, pal.accent, pal.dim));
             }
             lines.push(Line::from(spans));
@@ -198,4 +227,18 @@ fn cell(
         Some(x) => Span::styled(format!("{x:>w$.dec$}"), Style::default().fg(present)),
         None => Span::styled(format!("{:>w$}", "·"), Style::default().fg(absent)),
     }
+}
+
+/// The reconstructed channel value for the grid bucket at `ts`, or `None` when
+/// the bucket carries no appearance/action (absent, or a non-positive value —
+/// rendered as a dot, as the dashboard strips also skip `v <= 0`).
+fn chan_at(ch: &HashMap<i64, f64>, ts: i64) -> Option<f64> {
+    ch.get(&ts).copied().filter(|&v| v > 0.0)
+}
+
+/// Combined bolus+basal action for the condensed `ins` column; `None` when
+/// neither channel contributes in this bucket.
+fn total_insulin_at(bolus: &HashMap<i64, f64>, basal: &HashMap<i64, f64>, ts: i64) -> Option<f64> {
+    let sum = chan_at(bolus, ts).unwrap_or(0.0) + chan_at(basal, ts).unwrap_or(0.0);
+    (sum > 0.0).then_some(sum)
 }
