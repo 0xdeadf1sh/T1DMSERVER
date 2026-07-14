@@ -9,7 +9,7 @@
 //! `i` cycle the insulin series; mouse drag pans and the wheel zooms. The
 //! [`PaneView`] surface and [`InsulinDisplay`] are locked here.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -18,7 +18,7 @@ use ratatui::style::{Color, Style};
 use ratatui::Frame;
 
 use store::ReconstructedChannels;
-use t1dm_core::{snap_grid, BgUnit, Series, GRID_MS, TOD_BINS};
+use t1dm_core::{snap_grid, BgUnit, PredictionEvent, Series, GRID_MS, TOD_BINS};
 
 use super::{Action, Ctx, PaneView};
 use crate::boot::{put, put_str};
@@ -50,6 +50,35 @@ const BIO_H_MIN: u16 = 11;
 /// the strips begin to peek above the fold without any scrolling.
 const MIN_CHART_H: u16 = 6;
 const MAX_CHART_H: u16 = 36;
+
+/// Minimum wall-clock gap between store fetches backing the dashboard.
+/// The BG/insulin/carb/HR series and the forecast are pulled and — for the
+/// strips — reconstructed from the stored curve events, which is far too heavy
+/// to repeat on every animation frame (the live-point pulse and heartbeat
+/// redraw at the fps ceiling). A change to the visible window refetches at
+/// once; otherwise the cached bundle is reused until it ages past this, exactly
+/// as the footer/stats probes are throttled. Data is on a 5-minute cadence, so
+/// a sub-second staleness is invisible.
+const FETCH_REFRESH: Duration = Duration::from_millis(1000);
+
+/// Cached result of one dashboard store fetch, reused across animation frames
+/// until the visible window changes or [`FETCH_REFRESH`] elapses. Holds the raw
+/// series and reconstructed channels; the cheap per-frame derivations (insulin
+/// selection, forecast fan expansion) run off this each frame.
+struct FetchCache {
+    /// The `(t_left, t_right)` window this bundle was fetched for.
+    key: (i64, i64),
+    /// When the fetch ran, for the [`FETCH_REFRESH`] age check.
+    at: Instant,
+    bg_pts: Vec<(i64, f64)>,
+    hr_pts: Vec<(i64, f64)>,
+    hr_bpm: Option<f64>,
+    tz: i32,
+    channels: ReconstructedChannels,
+    pred: Option<PredictionEvent>,
+    notes: Vec<i64>,
+    photos: Vec<i64>,
+}
 
 /// Which insulin series the strip renders (dashboard `i` key).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,6 +136,8 @@ pub struct DashboardPane {
     heart_phase: f32,
     /// Most recent heart rate (bpm) in view, set on render, read on tick.
     hr_bpm: Option<f64>,
+    /// Throttled store-fetch cache; see [`FETCH_REFRESH`].
+    cache: Option<FetchCache>,
 }
 
 impl Default for DashboardPane {
@@ -121,6 +152,7 @@ impl Default for DashboardPane {
             scroll: ScrollState::new(),
             heart_phase: 0.0,
             hr_bpm: None,
+            cache: None,
         }
     }
 }
@@ -136,6 +168,62 @@ impl DashboardPane {
 
     fn pan_step(&self) -> i64 {
         self.zoom_ms * PAN_COLS
+    }
+
+    /// Pull every store-backed series the dashboard renders for the window
+    /// `[t_left, t_right]` in one shot. Heavy (five queries plus curve
+    /// reconstruction), so it is called only when [`FetchCache`] is stale.
+    fn fetch(&self, ctx: &Ctx, t_left: i64, t_right: i64, n_pts: usize) -> FetchCache {
+        let samples = ctx
+            .store
+            .get_samples(&Series::ALL, Some(t_left), Some(t_right), Some(n_pts), None)
+            .unwrap_or_default();
+        let bg_pts: Vec<(i64, f64)> = samples
+            .iter()
+            .filter_map(|r| r.bg.map(|v| (r.ts, v)))
+            .collect();
+        let hr_pts: Vec<(i64, f64)> = samples
+            .iter()
+            .filter_map(|r| r.hr.map(|v| (r.ts, v)))
+            .collect();
+        // Latest in-view heart rate drives the beating-heart indicator.
+        let hr_bpm = hr_pts.last().map(|&(_, v)| v).filter(|v| *v > 0.0);
+        let tz = samples.last().map(|r| r.tz_offset).unwrap_or(0);
+        // Insulin and carb strips are reconstructed from the stored
+        // meal/dose/basal events — each row resolved from its verbatim
+        // custom_curve when present, else the ported gamma/Bateman params —
+        // bucketized onto the grid with the §4-#6 basal XOR applied. Display-only.
+        let channels = ctx
+            .store
+            .reconstruct_channels(t_left, t_right)
+            .unwrap_or_default();
+        let pred = ctx.store.get_prediction_latest().ok().flatten();
+        let notes: Vec<i64> = ctx
+            .store
+            .get_notes(Some(t_left), Some(t_right))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| n.ts)
+            .collect();
+        let photos: Vec<i64> = ctx
+            .store
+            .get_photos(Some(t_left), Some(t_right))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.ts)
+            .collect();
+        FetchCache {
+            key: (t_left, t_right),
+            at: Instant::now(),
+            bg_pts,
+            hr_pts,
+            hr_bpm,
+            tz,
+            channels,
+            pred,
+            notes,
+            photos,
+        }
     }
 
     fn draw_title(
@@ -198,41 +286,39 @@ impl PaneView for DashboardPane {
         let t_right = now + future + self.pan_ms;
         let t_left = t_right - span;
 
-        // --- pull samples ---------------------------------------------------
+        // --- fetch (throttled) ---------------------------------------------
+        // The BG/HR series, the reconstructed insulin/carb channels, the latest
+        // forecast, and the note/photo markers are pulled here in one shot and
+        // cached. A moved window (pan/zoom/resize or the 5-minute `now` tick)
+        // refetches at once; otherwise the bundle is reused until it ages past
+        // FETCH_REFRESH, so the pulse/heartbeat animation re-renders from the
+        // cache each frame instead of re-hitting the store 60×/s.
         let n_pts = (span / GRID_MS + 4).clamp(1, 40_000) as usize;
-        let samples = ctx
-            .store
-            .get_samples(&Series::ALL, Some(t_left), Some(t_right), Some(n_pts), None)
-            .unwrap_or_default();
+        let key = (t_left, t_right);
+        let stale = self
+            .cache
+            .as_ref()
+            .is_none_or(|c| c.key != key || c.at.elapsed() >= FETCH_REFRESH);
+        if stale {
+            self.cache = Some(self.fetch(ctx, t_left, t_right, n_pts));
+        }
+        let data = self.cache.as_ref().expect("cache populated above");
 
-        let bg_pts: Vec<(i64, f64)> = samples
-            .iter()
-            .filter_map(|r| r.bg.map(|v| (r.ts, v)))
-            .collect();
-        // Insulin and carb strips are reconstructed from the stored
-        // meal/dose/basal events — each row resolved from its verbatim
-        // custom_curve when present, else the ported gamma/Bateman params —
-        // bucketized onto the grid with the §4-#6 basal XOR applied. The
-        // demoted `samples` scalars no longer carry carbs/bolus/basal, so this
-        // is the sole strip source. Display-only; not part of any byte-exact
-        // guarantee.
-        let channels = ctx
-            .store
-            .reconstruct_channels(t_left, t_right)
-            .unwrap_or_default();
-        let ins_pts: Vec<(i64, f64)> = self.insulin.select(&channels);
-        let carb_pts: Vec<(i64, f64)> = channels.carb.clone();
-        let hr_pts: Vec<(i64, f64)> = samples
-            .iter()
-            .filter_map(|r| r.hr.map(|v| (r.ts, v)))
-            .collect();
+        let bg_pts: Vec<(i64, f64)> = data.bg_pts.clone();
+        // The §4-#6 basal XOR is already applied inside reconstruct_channels, so
+        // selecting/summing the cached channels here can't double-count. The
+        // demoted `samples` scalars carry no carbs/bolus/basal — these curves
+        // are the sole strip source. Display-only; not byte-exact.
+        let ins_pts: Vec<(i64, f64)> = self.insulin.select(&data.channels);
+        let carb_pts: Vec<(i64, f64)> = data.channels.carb.clone();
+        let hr_pts: Vec<(i64, f64)> = data.hr_pts.clone();
         // Latest in-view heart rate drives the beating-heart indicator.
-        let hr_bpm = hr_pts.last().map(|&(_, v)| v).filter(|v| *v > 0.0);
+        let hr_bpm = data.hr_bpm;
+        let tz = data.tz;
+        let pred = data.pred.clone();
+        let notes: Vec<i64> = data.notes.clone();
+        let photos: Vec<i64> = data.photos.clone();
         self.hr_bpm = hr_bpm;
-        let tz = samples.last().map(|r| r.tz_offset).unwrap_or(0);
-
-        // --- pull the latest forecast --------------------------------------
-        let pred = ctx.store.get_prediction_latest().ok().flatten();
         let mut median_pts: Vec<(i64, f64)> = Vec::new();
         let mut fan_pts: Vec<(i64, [f64; 7])> = Vec::new();
         let mut tod = vec![0.0f64; TOD_BINS];
@@ -288,21 +374,7 @@ impl PaneView for DashboardPane {
             lo = (hi - 40.0).max(40.0);
         }
 
-        // --- markers --------------------------------------------------------
-        let notes: Vec<i64> = ctx
-            .store
-            .get_notes(Some(t_left), Some(t_right))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|n| n.ts)
-            .collect();
-        let photos: Vec<i64> = ctx
-            .store
-            .get_photos(Some(t_left), Some(t_right))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.ts)
-            .collect();
+        // Note/photo marker timestamps come from the cached bundle above.
 
         // --- stacked virtual layout ----------------------------------------
         // The BG chart occupies the top and takes its natural (large) size; the
