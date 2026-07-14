@@ -123,18 +123,34 @@ async fn bridge_events(hub: WsHub, tui_tx: broadcast::Sender<AppEvent>) {
     }
 }
 
-/// Watch the models directory; rescan the store on any change.
+/// Watch the models directory; rescan the store when an artifact changes.
 fn start_model_watcher(store: Store) -> anyhow::Result<notify::RecommendedWatcher> {
+    use notify::event::{EventKind, ModifyKind};
     use notify::{recommended_watcher, Event, RecursiveMode, Watcher};
 
     let dir = store.models_dir();
     std::fs::create_dir_all(&dir).ok();
     let s = store.clone();
     let mut watcher = recommended_watcher(move |res: notify::Result<Event>| {
-        if res.is_ok() {
-            if let Err(e) = s.refresh_models(&s.models_dir()) {
-                tracing::warn!("model rescan failed: {e}");
-            }
+        let Ok(event) = res else { return };
+        // React only to events that mean a model artifact actually changed —
+        // creation, content write, removal, or rename. Ignore Access and
+        // metadata events: `refresh_models` opens every file to hash it, and an
+        // open emits an `Access(Open)` (inotify IN_OPEN) event. Rescanning on
+        // that re-opens the files, which fires more opens — an unbounded
+        // feedback loop that pins a core re-reading the whole models directory
+        // several times a second. Excluding metadata guards the same loop on a
+        // `strictatime` mount, where a read would bump atime (IN_ATTRIB).
+        let relevant = matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_))
+            || matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any)
+            );
+        if !relevant {
+            return;
+        }
+        if let Err(e) = s.refresh_models(&s.models_dir()) {
+            tracing::warn!("model rescan failed: {e}");
         }
     })
     .context("creating fs watcher")?;
