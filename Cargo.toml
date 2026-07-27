@@ -1,8 +1,13 @@
 [package]
 name = "t1dmserver"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.96"
+description = "Single-user Type 1 Diabetes telemetry server and themed terminal dashboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+readme = "README.md"
+publish = false
 
 [[bin]]
 name = "t1dmserver"
@@ -25,5 +30,9 @@ anyhow = "1.0.103"
 notify = "8.2.0"
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.96"
+license = "MIT"
+authors = ["0xdeadf1sh"]
+repository = "https://github.com/0xdeadf1sh/T1DMSERVER"

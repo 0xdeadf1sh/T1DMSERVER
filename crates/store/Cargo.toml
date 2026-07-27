@@ -1,8 +1,12 @@
 [package]
 name = "t1dm-store"
-version = "0.1.0"
+description = "T1DMSERVER SQLite store: schema, serialized writer, read pool, tokens, and model registry"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
 
 [lib]
 name = "store"

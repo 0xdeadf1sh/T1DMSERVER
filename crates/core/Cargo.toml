@@ -1,8 +1,12 @@
 [package]
 name = "t1dm-core"
-version = "0.1.0"
+description = "T1DMSERVER domain types, units, curve maths, and the cross-crate contract"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
 
 [lib]
 name = "t1dm_core"
