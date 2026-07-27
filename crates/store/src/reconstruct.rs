@@ -4,8 +4,11 @@
 //! event (`meal_event`/`dose_event`/`basal_schedule_dose`). To render the
 //! time-aligned strips the TUI folds those stored events back onto the fixed
 //! 5-minute grid: each row is resolved from its verbatim `custom_curve` when
-//! present, else from its stored gamma/Bateman params via the ported
-//! [`t1dm_core::curve`] engine, then `bucketize`d onto the grid.
+//! present, else from its stored params via the ported [`t1dm_core::curve`]
+//! engine, then `bucketize`d onto the grid. The parametric fallbacks mirror the
+//! phone's `RoomDoseStore`: a meal's gamma is derived from its glycaemic index,
+//! and a bolus lacking BOTH `k` and `theta` falls to the Loop/OpenAPS
+//! exp-action kernel — never to a half-defaulted gamma.
 //!
 //! The §4-#6 basal XOR is applied here: an active daily schedule (tiled by
 //! `extend_basal`) is the SOLE basal source when present; only when no schedule
@@ -16,8 +19,9 @@
 //! IOB/COB guarantee.
 
 use t1dm_core::curve::{
-    bateman, bucketize, extend_basal, gamma, BasalDoseSpec, BasalSchedule as CurveSchedule,
-    CurveEvent, CurveKind, BASAL_KA_PER_HOUR, BASAL_KE_PER_HOUR, STEP_MS,
+    bateman, bucketize, carb_gamma_for_gi, exp_action_curve, extend_basal, gamma, BasalDoseSpec,
+    BasalSchedule as CurveSchedule, CurveEvent, CurveKind, BASAL_KA_PER_HOUR, BASAL_KE_PER_HOUR,
+    DEFAULT_GI, STEP_MS,
 };
 use t1dm_core::{snap_grid, DoseKind};
 
@@ -51,12 +55,15 @@ impl Store {
         let n_steps = ((grid_end - grid_start) / STEP_MS) as i32 + 1;
 
         // --- carbs -------------------------------------------------------
-        let meals = self.get_meals(Some(grid_start - TAIL_MARGIN_MS), Some(grid_end))?;
+        let meals = self.get_meals(Some(grid_start - TAIL_MARGIN_MS), Some(grid_end), None)?;
         let carb_events: Vec<CurveEvent> = meals
             .iter()
             .map(|m| {
                 let values = m.custom_curve.clone().unwrap_or_else(|| {
-                    gamma(m.grams, m.k.unwrap_or(3.0), m.theta.unwrap_or(20.0), m.duration_min)
+                    // A parametric meal resolves its gamma FROM its glycaemic index, exactly
+                    // as the phone's RoomDoseStore does; only an explicit k/theta overrides it.
+                    let (gk, gt, _) = carb_gamma_for_gi(m.gi.unwrap_or(DEFAULT_GI));
+                    gamma(m.grams, m.k.unwrap_or(gk), m.theta.unwrap_or(gt), m.duration_min)
                 });
                 CurveEvent {
                     start_ms: m.ts,
@@ -73,14 +80,24 @@ impl Store {
         );
 
         // --- bolus + discrete basal injections ---------------------------
-        let doses = self.get_doses(Some(grid_start - TAIL_MARGIN_MS), Some(grid_end))?;
+        let doses = self.get_doses(Some(grid_start - TAIL_MARGIN_MS), Some(grid_end), None)?;
         let mut bolus_events: Vec<CurveEvent> = Vec::new();
         let mut basal_inject_events: Vec<CurveEvent> = Vec::new();
         for d in &doses {
             match d.kind {
                 DoseKind::Bolus => {
                     let values = d.custom_curve.clone().unwrap_or_else(|| {
-                        gamma(d.units, d.k.unwrap_or(3.0), d.theta.unwrap_or(20.0), d.duration_min)
+                        // A gamma bolus reconstructs from BOTH its own stored params or not at
+                        // all: a clinical exp-action bolus normally rides in `custom_curve`, and
+                        // this is its degenerate fallback — no simulator gamma.
+                        match (d.k, d.theta) {
+                            (Some(k), Some(theta)) => gamma(d.units, k, theta, d.duration_min),
+                            _ => exp_action_curve(
+                                d.units,
+                                75.0_f64.min(d.duration_min * 0.4),
+                                d.duration_min,
+                            ),
+                        }
                     });
                     bolus_events.push(CurveEvent {
                         start_ms: d.ts,

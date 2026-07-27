@@ -31,6 +31,22 @@ const DT_MINUTES: f64 = 5.0;
 /// the reconstruction grid is keyed at the same cadence, so bucketize is a pure index map.
 pub const STEP_MS: i64 = 300_000;
 
+/// Upper bound on a [`bucketize`] grid: a few hundred thousand 5-min steps (~2.85 years) —
+/// far beyond any real forecast/history horizon. A larger `n_steps` is a caller bug; capping
+/// it keeps the `vec![0.0; n]` allocation bounded so a hostile size returns the documented
+/// `Err` rather than aborting the process on a failed allocation.
+const MAX_GRID_STEPS: i32 = 300_000;
+
+// ── Carb appearance presets — the GI → gamma map (CurveEngine.Presets) ──────────────────
+/// Low-GI (bread/pasta ⇒ spread) and high-GI (juice ⇒ early peak) gamma endpoints that
+/// [`carb_gamma_for_gi`] interpolates between.
+pub const CARB_GI_K_LO: f64 = 4.5;
+pub const CARB_GI_K_HI: f64 = 2.0;
+pub const CARB_GI_THETA_LO: f64 = 30.0;
+pub const CARB_GI_THETA_HI: f64 = 15.0;
+/// Fallback GI when a meal carries neither explicit gamma params nor a GI (medium-GI).
+pub const DEFAULT_GI: f64 = 50.0;
+
 // ── Canonical NOISE-FREE basal presets, transcribed from simulator.py ───────────────────
 /// Long-acting basal Bateman absorption / elimination rates (1/h).
 /// `simulator.BASAL_KA_PER_HOUR` / `_KE_PER_HOUR`. tmax = ln(ka/ke)/(ka-ke) ≈ 6.3 h — a
@@ -124,6 +140,19 @@ pub fn gamma(total_amount: f64, k: f64, theta: f64, duration_min: f64) -> Vec<f6
         }
     }
     values
+}
+
+/// Map a glycemic index (0..100) onto the carb appearance gamma `(k, theta, dur_min)`.
+/// High GI (juice ⇒ fast, high early peak) sits at the simulator's fast-carb central values
+/// (k≈2, θ≈15); low GI (bread/pasta ⇒ spread) at its slow-carb values (k≈4.5, θ≈30), linearly
+/// interpolated in between. Peak = (k-1)·θ; the duration gives ~5 mean-lives of tail so the
+/// gamma integrates to ~grams.
+pub fn carb_gamma_for_gi(gi: f64) -> (f64, f64, f64) {
+    let g = gi.clamp(0.0, 100.0) / 100.0;
+    let k = CARB_GI_K_LO + (CARB_GI_K_HI - CARB_GI_K_LO) * g;
+    let theta = CARB_GI_THETA_LO + (CARB_GI_THETA_HI - CARB_GI_THETA_LO) * g;
+    let dur_min = (k * theta * 4.0).clamp(120.0, 360.0);
+    (k, theta, dur_min)
 }
 
 // ── basal_curve (simulator.py:801) — Bateman one-compartment long-acting PK ─────────────
@@ -238,6 +267,11 @@ pub fn bucketize(
     if n_steps < 0 {
         return Err(CoreError::Invalid(format!(
             "bucketize n_steps must be >= 0, got {n_steps}"
+        )));
+    }
+    if n_steps > MAX_GRID_STEPS {
+        return Err(CoreError::Invalid(format!(
+            "bucketize n_steps {n_steps} exceeds cap {MAX_GRID_STEPS}"
         )));
     }
     let n = n_steps as usize;
@@ -491,6 +525,34 @@ mod tests {
     #[test]
     fn bucketize_rejects_negative_n() {
         assert!(bucketize(vec![], 0, -1, CurveKind::Carb).is_err());
+    }
+
+    #[test]
+    fn bucketize_rejects_oversized_n() {
+        // A wildly large n_steps must fail-closed with Err, not attempt a giant allocation.
+        assert!(bucketize(vec![], 0, i32::MAX, CurveKind::Carb).is_err());
+        assert!(bucketize(vec![], 0, MAX_GRID_STEPS + 1, CurveKind::Carb).is_err());
+        // The cap itself is still accepted (bounded allocation).
+        assert!(bucketize(vec![], 0, MAX_GRID_STEPS, CurveKind::Carb).is_ok());
+    }
+
+    // ── carb_gamma_for_gi: the GI → gamma map the meal fallback resolves through ──────────
+    #[test]
+    fn carb_gamma_for_gi_interpolates_the_presets() {
+        assert_eq!(carb_gamma_for_gi(0.0).0, 4.5);
+        assert_eq!(carb_gamma_for_gi(0.0).1, 30.0);
+        assert_eq!(carb_gamma_for_gi(100.0).0, 2.0);
+        assert_eq!(carb_gamma_for_gi(100.0).1, 15.0);
+        // The medium-GI default: k 3.25, θ 22.5 ⇒ peak (k-1)·θ = 50.625 min.
+        let (k, theta, dur) = carb_gamma_for_gi(DEFAULT_GI);
+        assert!((k - 3.25).abs() < 1e-12, "k = {k}");
+        assert!((theta - 22.5).abs() < 1e-12, "theta = {theta}");
+        assert!((dur - 292.5).abs() < 1e-12, "dur = {dur}");
+        // Out-of-range GI clamps rather than extrapolating.
+        assert_eq!(carb_gamma_for_gi(-10.0), carb_gamma_for_gi(0.0));
+        assert_eq!(carb_gamma_for_gi(250.0), carb_gamma_for_gi(100.0));
+        // Duration floor/ceiling.
+        assert_eq!(carb_gamma_for_gi(100.0).2, 120.0);
     }
 
     // ── on_board: remaining tail area, monotone non-increasing in time ───────────────────

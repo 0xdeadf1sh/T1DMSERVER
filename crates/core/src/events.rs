@@ -3,12 +3,15 @@
 //! a self-describing curve keyed by a phone-assigned `client_id`; the server
 //! stores it verbatim and never re-stamps the phone `updated_at`.
 //!
-//! These are the *write* shapes accepted on `PUT /v1/{meals,doses,
-//! basal-schedule,predictions}`, so an absent optional field follows the same
-//! house style as [`crate::ingest`]: `skip_serializing_if` omits it. The read
-//! shapes served back on the matching `GET`s omit `skip_serializing_if`, so a
-//! gap serializes as an explicit `null`, and they carry no server-internal
-//! `id`/`received_at`/`created_at`.
+//! [`MealEvent`] and [`DoseEvent`] are each a single shape serving both roles:
+//! the body accepted on `PUT /v1/{meals,doses}` and the record served back on
+//! the matching `GET` and stream frame. Being read shapes, they carry no
+//! `skip_serializing_if`, so an absent optional always crosses the wire as an
+//! explicit `null`; `#[serde(default)]` still lets a writer omit the key
+//! entirely. [`PredictionWrite`] is write-only — the server never serializes it
+//! back, so it keeps the omit-on-absent house style of [`crate::ingest`], and
+//! the forecast read shape is [`crate::domain::PredictionEvent`]. None of these
+//! carry the server-internal `id`/`received_at`/`created_at`.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,15 +30,15 @@ pub struct MealEvent {
     pub updated_at: i64,
     pub grams: f64,
     pub duration_min: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub gi: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub k: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub theta: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub custom_curve: Option<Vec<f64>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub note: Option<String>,
 }
 
@@ -68,17 +71,17 @@ pub struct DoseEvent {
     pub kind: DoseKind,
     pub units: f64,
     pub duration_min: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub k: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub theta: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub ka_per_hour: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub ke_per_hour: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub custom_curve: Option<Vec<f64>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub note: Option<String>,
 }
 
@@ -107,8 +110,9 @@ pub struct BasalSlot {
 }
 
 /// The circadian (time-of-day) belief emitted by the model's optional time
-/// head, carried verbatim on a [`PredictionWrite`]. Absent (serialized as an
-/// explicit `null`) when the model has no time head.
+/// head, carried verbatim on a [`PredictionWrite`] and absent when the model has
+/// no time head. The forecast read shape ([`crate::domain::PredictionEvent`])
+/// serializes that gap as an explicit `null`; the write shape omits the key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Circadian {
     pub probs: Vec<f64>,
@@ -131,4 +135,71 @@ pub struct PredictionWrite {
     pub fan: Vec<Vec<f64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circadian: Option<Circadian>,
+}
+
+#[cfg(test)]
+mod tests {
+    //! The read/write duality of the curve events: what the server serves back
+    //! must spell a gap out as `null`, while a writer may still omit the key.
+    use super::*;
+
+    fn meal() -> MealEvent {
+        MealEvent {
+            client_id: "meal-1".into(),
+            ts: 1_609_459_200_000,
+            tz_offset: 0,
+            updated_at: 1_000,
+            grams: 30.0,
+            duration_min: 180.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn meal_and_dose_serialize_an_absent_optional_as_explicit_null() {
+        let v = serde_json::to_value(meal()).unwrap();
+        for key in ["gi", "k", "theta", "custom_curve", "note"] {
+            assert_eq!(v.get(key), Some(&serde_json::Value::Null), "meal.{key}");
+        }
+
+        let dose = DoseEvent {
+            client_id: "dose-1".into(),
+            ts: 1_609_459_200_000,
+            updated_at: 1_000,
+            units: 4.5,
+            duration_min: 240.0,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(dose).unwrap();
+        for key in [
+            "k",
+            "theta",
+            "ka_per_hour",
+            "ke_per_hour",
+            "custom_curve",
+            "note",
+        ] {
+            assert_eq!(v.get(key), Some(&serde_json::Value::Null), "dose.{key}");
+        }
+    }
+
+    #[test]
+    fn an_omitted_and_a_null_optional_read_back_the_same() {
+        let written = r#"{"client_id":"meal-1","ts":1609459200000,"tz_offset":0,
+            "updated_at":1000,"grams":30.0,"duration_min":180.0}"#;
+        let omitted: MealEvent = serde_json::from_str(written).unwrap();
+        assert_eq!(omitted, meal(), "an omitted optional still defaults to None");
+
+        let served = serde_json::to_string(&meal()).unwrap();
+        let explicit: MealEvent = serde_json::from_str(&served).unwrap();
+        assert_eq!(explicit, omitted, "the served shape round-trips as a write");
+    }
+
+    #[test]
+    fn prediction_write_omits_an_absent_circadian() {
+        // Write-only: the server never serves a `PredictionWrite` back, so it
+        // keeps the omit-on-absent style. `PredictionEvent` is the read shape.
+        let v = serde_json::to_value(PredictionWrite::default()).unwrap();
+        assert!(v.get("circadian").is_none());
+    }
 }

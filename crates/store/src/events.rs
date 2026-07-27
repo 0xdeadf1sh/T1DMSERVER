@@ -25,7 +25,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 use t1dm_core::{BasalSchedule, BasalSlot, DoseEvent, DoseKind, MealEvent};
 
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 use crate::{now_ms, Store};
 
 // ----- shared helpers -----------------------------------------------------
@@ -34,6 +34,13 @@ use crate::{now_ms, Store};
 /// A malformed blob degrades to `None` rather than failing the whole read.
 fn parse_curve(text: Option<String>) -> Option<Vec<f64>> {
     text.and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// Bind value for an opt-in `LIMIT`. SQLite reads a negative limit as
+/// unbounded, so `None` returns the full range exactly as it did before
+/// pagination existed.
+fn row_limit(limit: Option<usize>) -> i64 {
+    limit.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX))
 }
 
 /// The SQLite text stored for a [`DoseKind`] (matches the `CHECK` constraint).
@@ -223,8 +230,15 @@ impl Store {
     // ----- meals ----------------------------------------------------------
 
     /// Idempotent batch upsert of meal curves (key `client_id`, upsert-on-newer).
-    /// Returns the canonical row for each input, in request order.
+    /// Returns the canonical row for each input, in request order. An off-grid
+    /// `ts` anywhere in the batch rejects the whole batch before any row is
+    /// written.
     pub fn put_meals(&self, meals: &[MealEvent]) -> Result<Vec<MealEvent>> {
+        for meal in meals {
+            if !t1dm_core::on_grid(meal.ts) {
+                return Err(StoreError::OffGrid(meal.ts));
+            }
+        }
         let now = now_ms();
         self.with_writer(|conn| {
             let tx = conn.unchecked_transaction()?;
@@ -261,17 +275,26 @@ impl Store {
         })
     }
 
-    /// Meals with `ts` in `[from, to]`, ascending.
-    pub fn get_meals(&self, from: Option<i64>, to: Option<i64>) -> Result<Vec<MealEvent>> {
+    /// Meals with `ts` in `[from, to]`, ascending, at most `limit` rows.
+    /// `limit = None` is unbounded: the phone's desync-forced full resync asks
+    /// for the whole history and does not page, so a default bound would
+    /// silently truncate its catch-up.
+    pub fn get_meals(
+        &self,
+        from: Option<i64>,
+        to: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<MealEvent>> {
         let lo = from.unwrap_or(i64::MIN);
         let hi = to.unwrap_or(i64::MAX);
+        let lim = row_limit(limit);
         self.with_reader(|conn| {
             let sql = format!(
-                "SELECT {MEAL_COLS} FROM meal_event WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts ASC"
+                "SELECT {MEAL_COLS} FROM meal_event WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts ASC LIMIT ?3"
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
-                .query_map(params![lo, hi], map_meal)?
+                .query_map(params![lo, hi, lim], map_meal)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -285,8 +308,15 @@ impl Store {
     // ----- doses ----------------------------------------------------------
 
     /// Idempotent batch upsert of dose curves (key `client_id`, upsert-on-newer).
-    /// Returns the canonical row for each input, in request order.
+    /// Returns the canonical row for each input, in request order. An off-grid
+    /// `ts` anywhere in the batch rejects the whole batch before any row is
+    /// written.
     pub fn put_doses(&self, doses: &[DoseEvent]) -> Result<Vec<DoseEvent>> {
+        for dose in doses {
+            if !t1dm_core::on_grid(dose.ts) {
+                return Err(StoreError::OffGrid(dose.ts));
+            }
+        }
         let now = now_ms();
         self.with_writer(|conn| {
             let tx = conn.unchecked_transaction()?;
@@ -325,17 +355,24 @@ impl Store {
         })
     }
 
-    /// Doses with `ts` in `[from, to]`, ascending.
-    pub fn get_doses(&self, from: Option<i64>, to: Option<i64>) -> Result<Vec<DoseEvent>> {
+    /// Doses with `ts` in `[from, to]`, ascending, at most `limit` rows.
+    /// `limit = None` is unbounded, for the same reason as [`Store::get_meals`].
+    pub fn get_doses(
+        &self,
+        from: Option<i64>,
+        to: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<DoseEvent>> {
         let lo = from.unwrap_or(i64::MIN);
         let hi = to.unwrap_or(i64::MAX);
+        let lim = row_limit(limit);
         self.with_reader(|conn| {
             let sql = format!(
-                "SELECT {DOSE_COLS} FROM dose_event WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts ASC"
+                "SELECT {DOSE_COLS} FROM dose_event WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts ASC LIMIT ?3"
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
-                .query_map(params![lo, hi], map_dose)?
+                .query_map(params![lo, hi, lim], map_dose)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -352,12 +389,67 @@ impl Store {
     /// upsert-on-newer by `client_id`; when `sched.active`, this schedule becomes
     /// the SOLE active one — every slot of any other schedule is deactivated and
     /// any slot of this schedule absent from the incoming set is dropped (a true
-    /// replace). Returns the canonical stored schedule (by `schedule_id`).
+    /// replace); when it is not, this schedule is retired and its slots are left
+    /// intact. Returns the canonical stored schedule (by `schedule_id`).
+    ///
+    /// The activation is itself upsert-on-newer: a redelivered PUT whose version
+    /// (the newest slot `updated_at`, the phone's own definition) predates the
+    /// stored or the live schedule's is a whole no-op, so a retried stale write
+    /// cannot resurrect a superseded schedule. Staleness is decided from the
+    /// incoming version alone and BEFORE any row is touched — deriving it from
+    /// whether an upsert landed would let a stale replay of a slot the newer PUT
+    /// deleted insert that slot fresh, disarm its own gate, and re-prune the
+    /// schedule back to the stale slot set.
     pub fn put_basal_schedule(&self, sched: &BasalSchedule) -> Result<BasalSchedule> {
         let now = now_ms();
         let active_flag: i64 = if sched.active { 1 } else { 0 };
+        let version = sched.slots.iter().map(|s| s.updated_at).max();
         self.with_writer(|conn| {
             let tx = conn.unchecked_transaction()?;
+
+            // Two independent thresholds. Against THIS schedule's stored revision,
+            // so a late retry of an older revision cannot prune away newer slots —
+            // the phone keeps one stable `schedule_id`, so a rival-only comparison
+            // would never fire for it. Against a *different* live schedule, so a
+            // superseded schedule cannot take activation back.
+            let stored_version: Option<i64> = tx.query_row(
+                "SELECT MAX(updated_at) FROM basal_schedule_dose WHERE schedule_id = ?1",
+                params![sched.schedule_id],
+                |r| r.get(0),
+            )?;
+            let live_version: Option<i64> = tx.query_row(
+                "SELECT MAX(updated_at) FROM basal_schedule_dose
+                 WHERE active = 1 AND schedule_id != ?1",
+                params![sched.schedule_id],
+                |r| r.get(0),
+            )?;
+            // The rival threshold speaks only to *taking activation back*, so it
+            // applies to a schedule_id the store already knows. A first-ever
+            // activation is not a resurrection, and its slot stamps may legitimately
+            // predate the outgoing schedule's newest edit.
+            let rival_version = live_version.filter(|_| stored_version.is_some());
+            // A slot-less schedule carries no version and so is never stale: an
+            // empty active PUT is how the phone clears the template.
+            let stale = match version {
+                Some(v) => [stored_version, rival_version]
+                    .into_iter()
+                    .flatten()
+                    .any(|threshold| v < threshold),
+                None => false,
+            };
+
+            if stale {
+                // A pure redelivery older than the live schedule: touch nothing,
+                // and report back whatever the store canonically holds.
+                let canonical = select_schedule_by_id(&tx, &sched.schedule_id)?;
+                tx.commit()?;
+                return Ok(canonical.unwrap_or_else(|| BasalSchedule {
+                    schedule_id: sched.schedule_id.clone(),
+                    active: sched.active,
+                    slots: Vec::new(),
+                }));
+            }
+
             for slot in &sched.slots {
                 tx.execute(
                     BASAL_UPSERT,
@@ -385,6 +477,13 @@ impl Store {
                      WHERE schedule_id != ?1 AND active != 0",
                     params![sched.schedule_id],
                 )?;
+                // The slot upserts above are guarded on `updated_at`, so a re-PUT
+                // of an unchanged schedule no-ops them; assert this schedule's
+                // activation outright or it would stay retired with nothing live.
+                tx.execute(
+                    "UPDATE basal_schedule_dose SET active = 1 WHERE schedule_id = ?1",
+                    params![sched.schedule_id],
+                )?;
                 // Drop slots of this schedule not present in the incoming set.
                 if sched.slots.is_empty() {
                     tx.execute(
@@ -407,6 +506,11 @@ impl Store {
                     }
                     tx.execute(&sql, params_from_iter(binds))?;
                 }
+            } else {
+                tx.execute(
+                    "UPDATE basal_schedule_dose SET active = 0 WHERE schedule_id = ?1",
+                    params![sched.schedule_id],
+                )?;
             }
 
             let canonical = select_schedule_by_id(&tx, &sched.schedule_id)?;

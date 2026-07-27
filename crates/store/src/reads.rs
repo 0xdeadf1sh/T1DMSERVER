@@ -139,10 +139,19 @@ impl Store {
         })
     }
 
-    /// The single most recent prediction, if any.
+    /// The single most recent prediction, if any. The table's identity is
+    /// `(made_at, model_id)` and the phone pushes every running model of a cycle
+    /// in one batch, so several rows legitimately share one `made_at`; the
+    /// `updated_at, id` tiebreak makes the pick the LAST-WRITTEN model of the
+    /// newest cycle, deterministic across repeated reads of an unchanged store.
+    /// It is not necessarily the model the phone displays — the wire carries no
+    /// selection/status flag, so the server cannot know which that is.
     pub fn get_prediction_latest(&self) -> Result<Option<PredictionEvent>> {
         self.with_reader(|conn| {
-            let sql = format!("SELECT {PRED_COLS} FROM prediction ORDER BY made_at DESC LIMIT 1");
+            let sql = format!(
+                "SELECT {PRED_COLS} FROM prediction
+                 ORDER BY made_at DESC, updated_at DESC, id DESC LIMIT 1"
+            );
             let out = conn.query_row(&sql, [], map_prediction).optional()?;
             Ok(out)
         })

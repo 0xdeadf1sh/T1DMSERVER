@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod extract;
 pub mod handlers;
 pub mod hub;
 pub(crate) mod util;
@@ -17,6 +18,7 @@ pub use hub::{Event, HubMsg, WsHub};
 
 use std::net::SocketAddr;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 use axum::Router;
 use tower_http::cors::CorsLayer;
@@ -30,6 +32,12 @@ pub struct AppState {
     pub store: Store,
     pub hub: WsHub,
 }
+
+/// Ceiling on any request body. axum's own default is 2 MiB, under which a
+/// routine phone camera JPEG posted to `/v1/photos` — the client uploads the
+/// picked image unrecompressed — fails outright, and the photo path is not
+/// queued, so the image is lost rather than retried.
+pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Build the complete `/v1` router. The returned [`Router`] already carries
 /// its state and is ready to hand to `axum::serve`.
@@ -69,6 +77,7 @@ pub fn build_router(store: Store, hub: WsHub) -> Router {
 
     Router::new()
         .nest("/v1", v1)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)

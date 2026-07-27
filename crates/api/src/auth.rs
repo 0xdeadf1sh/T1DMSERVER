@@ -4,7 +4,7 @@
 
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::extract::{ConnectInfo, FromRequestParts, Query};
 use axum::http::request::Parts;
 
 use t1dm_core::{Token, TokenKind};
@@ -70,6 +70,51 @@ impl FromRequestParts<AppState> for Auth {
             token,
             session_id: session.id,
         })
+    }
+}
+
+/// A stream request context. The socket's credential rides `?token=<secret>`
+/// rather than an `Authorization` header, so it cannot reuse [`Auth`]. It is an
+/// extractor rather than an in-handler check so that an absent, unknown, or
+/// revoked token answers 401 *before* the upgrade handshake is evaluated, as
+/// the contract promises — otherwise a bad token on a malformed handshake would
+/// answer 426 instead.
+#[derive(Debug, Clone)]
+pub struct WsAuth(pub Auth);
+
+impl FromRequestParts<AppState> for WsAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let Query(q) = Query::<crate::handlers::WsQuery>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| ApiError::Unauthorized)?;
+        let secret = q.token.ok_or(ApiError::Unauthorized)?;
+        let store = state.store.clone();
+        let token = crate::util::blocking(move || store.verify_secret(&secret))
+            .await?
+            .ok_or(ApiError::Unauthorized)?;
+
+        // The session persists across WS reconnects.
+        let ip = client_ip(parts);
+        let ua = parts
+            .headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("websocket")
+            .to_string();
+        let token_id = token.id;
+        let store = state.store.clone();
+        let session =
+            crate::util::blocking(move || store.upsert_session(token_id, &ip, &ua, &ua)).await?;
+
+        Ok(WsAuth(Auth {
+            token,
+            session_id: session.id,
+        }))
     }
 }
 

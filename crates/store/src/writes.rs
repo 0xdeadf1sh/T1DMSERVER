@@ -128,11 +128,14 @@ impl Store {
     }
 
     /// Store a meal photo: write the binary under `photos/<sha>.<ext>` and record
-    /// its metadata. `width`/`height` are supplied by the decoder. Idempotent on
-    /// the content hash (#7): re-posting the same photo returns the canonical
-    /// existing row rather than inserting a duplicate. The `photo` table carries
-    /// no UNIQUE(sha256) index, so this guards by SELECT rather than
-    /// `ON CONFLICT(sha256)`.
+    /// its metadata. `width`/`height` are supplied by the decoder. A photo's
+    /// identity is the ATTACHMENT — `(sha256, ts)`, not the content hash alone —
+    /// because the phone mints no id for it and re-attaching one saved image to a
+    /// later meal is a genuinely distinct event. Idempotent on that pair (#7): an
+    /// exact re-POST returns the canonical existing row rather than inserting a
+    /// duplicate, while the same bytes at another `ts` get their own row sharing
+    /// the content-addressed file. The `photo` table carries no UNIQUE index, so
+    /// this guards by SELECT rather than `ON CONFLICT`.
     pub fn add_photo(
         &self,
         ts: i64,
@@ -153,8 +156,8 @@ impl Store {
             if let Some(existing) = conn
                 .query_row(
                     "SELECT id, ts, path, sha256, width, height, bytes, created_at
-                     FROM photo WHERE sha256 = ?1",
-                    params![sha],
+                     FROM photo WHERE sha256 = ?1 AND ts = ?2",
+                    params![sha, ts],
                     |r| {
                         Ok(Photo {
                             id: r.get(0)?,
@@ -278,9 +281,9 @@ impl Store {
 /// Insert or replace one prediction row within a transaction, idempotent on
 /// `(made_at, model_id)`; returns the canonical row id. `made_at` is the phone's
 /// cycle timestamp, stored verbatim (never the server clock); the mutable
-/// forecast columns are overwritten on a re-run while the internal `created_at`
-/// stamp is preserved. The circadian belief is stored as its JSON object, or SQL
-/// NULL when the model has no time head.
+/// forecast columns are overwritten on a re-run carrying a newer `updated_at`
+/// while the internal `created_at` stamp is preserved. The circadian belief is
+/// stored as its JSON object, or SQL NULL when the model has no time head.
 fn insert_prediction(
     conn: &rusqlite::Connection,
     pred: &PredictionWrite,
@@ -301,7 +304,8 @@ fn insert_prediction(
             line          = excluded.line,
             fan           = excluded.fan,
             circadian     = excluded.circadian,
-            updated_at    = excluded.updated_at",
+            updated_at    = excluded.updated_at
+         WHERE excluded.updated_at > prediction.updated_at",
         params![
             pred.made_at,
             pred.model_id,

@@ -11,6 +11,7 @@ pub enum ApiError {
     Forbidden,
     NotFound(String),
     BadRequest(String),
+    PayloadTooLarge(String),
     Internal(String),
 }
 
@@ -21,6 +22,7 @@ impl std::fmt::Display for ApiError {
             ApiError::Forbidden => write!(f, "forbidden"),
             ApiError::NotFound(s) => write!(f, "not found: {s}"),
             ApiError::BadRequest(s) => write!(f, "bad request: {s}"),
+            ApiError::PayloadTooLarge(s) => write!(f, "payload too large: {s}"),
             ApiError::Internal(s) => write!(f, "internal error: {s}"),
         }
     }
@@ -30,7 +32,17 @@ impl std::error::Error for ApiError {}
 
 impl From<store::StoreError> for ApiError {
     fn from(e: store::StoreError) -> Self {
-        ApiError::Internal(e.to_string())
+        match &e {
+            // Caller-correctable input: as a 500 the client would retry with
+            // backoff forever instead of fixing the timestamp.
+            store::StoreError::OffGrid(_) => ApiError::BadRequest(e.to_string()),
+            store::StoreError::Invalid(_) => ApiError::BadRequest(e.to_string()),
+            store::StoreError::NotFound(_) => ApiError::NotFound(e.to_string()),
+            // Everything left is a genuine server fault. It must stay a 5xx:
+            // the client drops a 4xx row permanently, and a clinical record
+            // must survive a transient database or filesystem failure.
+            _ => ApiError::Internal(e.to_string()),
+        }
     }
 }
 
@@ -47,6 +59,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, self.to_string()),
             ApiError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            ApiError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, self.to_string()),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
         (status, Json(json!({ "error": msg }))).into_response()

@@ -51,8 +51,13 @@ impl std::str::FromStr for StatsWindow {
     }
 }
 
-/// A glycemic event (contiguous hypo or hyper excursion): count and total
-/// duration in milliseconds.
+/// A glycemic excursion tally, as the phone defines one: a maximal run of at
+/// least two consecutive BG-bearing samples past the configured target edge.
+/// `count` is the number of such runs; `duration_ms` is their total, each run
+/// measured last timestamp minus first — one grid step short of the span it
+/// covers. A dropout of up to 30 minutes is bridged into a single run; a longer
+/// one splits it, and either fragment shorter than two samples is discarded.
+/// A lone out-of-range sample therefore contributes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct EventStat {
     pub count: u32,
@@ -61,14 +66,26 @@ pub struct EventStat {
 
 /// Full statistics for one window. All BG figures in mg/dL; time-in-range
 /// fractions are 0..=1. Computed on the phone and stored by the server verbatim.
+///
+/// Five fields the schema carries are not populated by the current phone build
+/// and so always arrive as `0.0`, indistinguishable from a genuine zero:
+/// `mean_hr` and `bg_hr_corr` are not computed there at all, and
+/// `mean_daily_carbs`, `tdd` and `bolus_basal_ratio` reduce over sample columns
+/// that no longer exist — carbohydrate and insulin totals travel as meal and
+/// dose curve events, so the sums they reduce are empty. Do not present any of
+/// the five as a measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Stats {
     pub window: StatsWindow,
-    /// Time-in-range 70–180 mg/dL, as a fraction 0..=1.
+    /// Phone millisecond clock at which the block was computed.
+    pub updated_at: i64,
+    /// Time in the target range configured on the phone (default 70–180 mg/dL),
+    /// as a fraction 0..=1. The edges are not carried on the wire, so this
+    /// fraction cannot be reinterpreted against any other pair.
     pub tir: f64,
-    /// Time below 70 mg/dL, fraction 0..=1.
+    /// Time below the configured target low, fraction 0..=1.
     pub time_below: f64,
-    /// Time above 180 mg/dL, fraction 0..=1.
+    /// Time above the configured target high, fraction 0..=1.
     pub time_above: f64,
     pub mean_bg: f64,
     /// Glucose Management Indicator (%).
@@ -78,13 +95,16 @@ pub struct Stats {
     pub sd: f64,
     pub hypo_events: EventStat,
     pub hyper_events: EventStat,
+    /// Nominally g/day. Not populated by the current phone build; see the type docs.
     pub mean_daily_carbs: f64,
-    /// Total daily insulin (U/day).
+    /// Nominally total daily insulin (U/day). Not populated; see the type docs.
     pub tdd: f64,
-    /// Bolus : basal ratio.
+    /// Nominally the bolus : basal ratio. Not populated; see the type docs.
     pub bolus_basal_ratio: f64,
+    /// Nominally a mean heart rate. Not computed on the phone at all.
     pub mean_hr: f64,
-    /// Pearson correlation of BG and HR over the window (-1..=1).
+    /// Nominally the Pearson correlation of BG and HR over the window (-1..=1).
+    /// Not computed on the phone at all.
     pub bg_hr_corr: f64,
     /// Number of grid samples that contributed BG to this window.
     pub n_samples: u32,
@@ -95,6 +115,7 @@ impl Stats {
     pub fn empty(window: StatsWindow) -> Self {
         Stats {
             window,
+            updated_at: 0,
             tir: 0.0,
             time_below: 0.0,
             time_above: 0.0,

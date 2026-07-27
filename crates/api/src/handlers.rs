@@ -1,12 +1,12 @@
 //! REST + WS handlers. Every store touch is shunted onto the blocking pool
 //! via [`crate::util::blocking`] so the async workers never stall on rusqlite.
 
-use std::net::SocketAddr;
 use std::str::FromStr;
 
 use axum::body::{Body, Bytes};
+use axum::extract::multipart::MultipartError;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Multipart, Path, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -18,8 +18,9 @@ use t1dm_core::{
     StatsWindow,
 };
 
-use crate::auth::{Auth, RwAuth};
+use crate::auth::{Auth, RwAuth, WsAuth};
 use crate::error::{ApiError, ApiResult};
+use crate::extract::{JsonBody, RawBody};
 use crate::hub::Event;
 use crate::util::blocking;
 use crate::AppState;
@@ -30,6 +31,9 @@ use crate::AppState;
 pub struct RangeQuery {
     pub from: Option<i64>,
     pub to: Option<i64>,
+    /// Row cap, not a page: these endpoints expose no cursor, because `ts` is
+    /// not unique on the event tables. Absent means the whole range.
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,7 +53,7 @@ pub struct StatsQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
-    pub token: String,
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,7 +100,7 @@ fn parse_fields(spec: &Option<String>) -> Result<Vec<Series>, ApiError> {
 pub async fn ingest(
     State(app): State<AppState>,
     auth: RwAuth,
-    Json(bundle): Json<IngestBundle>,
+    JsonBody(bundle): JsonBody<IngestBundle>,
 ) -> ApiResult<Json<Value>> {
     let origin = auth.0.token.id;
     let ts = bundle.ts;
@@ -122,7 +126,7 @@ pub async fn ingest(
 pub async fn put_meals(
     State(app): State<AppState>,
     auth: RwAuth,
-    Json(meals): Json<Vec<MealEvent>>,
+    JsonBody(meals): JsonBody<Vec<MealEvent>>,
 ) -> ApiResult<Json<Value>> {
     let origin = auth.0.token.id;
     let store = app.store.clone();
@@ -139,7 +143,7 @@ pub async fn put_meals(
 pub async fn put_doses(
     State(app): State<AppState>,
     auth: RwAuth,
-    Json(doses): Json<Vec<DoseEvent>>,
+    JsonBody(doses): JsonBody<Vec<DoseEvent>>,
 ) -> ApiResult<Json<Value>> {
     let origin = auth.0.token.id;
     let store = app.store.clone();
@@ -156,7 +160,7 @@ pub async fn put_doses(
 pub async fn put_basal_schedule(
     State(app): State<AppState>,
     auth: RwAuth,
-    Json(schedule): Json<BasalSchedule>,
+    JsonBody(schedule): JsonBody<BasalSchedule>,
 ) -> ApiResult<Json<Value>> {
     let origin = auth.0.token.id;
     let store = app.store.clone();
@@ -170,7 +174,7 @@ pub async fn put_basal_schedule(
 pub async fn put_predictions(
     State(app): State<AppState>,
     auth: RwAuth,
-    Json(preds): Json<Vec<PredictionWrite>>,
+    JsonBody(preds): JsonBody<Vec<PredictionWrite>>,
 ) -> ApiResult<Json<Value>> {
     let origin = auth.0.token.id;
     let store = app.store.clone();
@@ -189,11 +193,13 @@ pub async fn put_predictions(
 
 /// Store a phone-pushed statistics block for one window verbatim. The body is
 /// the opaque phone `Stats` JSON; only `window` and `updated_at` are peeled
-/// off to key and guard the upsert. Fans out except-origin.
+/// off to key and guard the upsert. `window` must name a window the readers
+/// know (`7d`/`30d`/`90d`) or the push is rejected with 400; it is stored and
+/// echoed in its canonical spelling. Fans out except-origin.
 pub async fn put_stats(
     State(app): State<AppState>,
     auth: RwAuth,
-    body: Bytes,
+    RawBody(body): RawBody,
 ) -> ApiResult<Json<Value>> {
     let origin = auth.0.token.id;
     let raw = std::str::from_utf8(body.as_ref())
@@ -204,27 +210,30 @@ pub async fn put_stats(
     let value: Value =
         serde_json::from_str(&raw).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    let window = key.window;
+    let window = StatsWindow::from_str(&key.window)?;
     let updated_at = key.updated_at;
     let store = app.store.clone();
-    let store_window = window.clone();
     // Persist the phone clock verbatim; `put_stats_block` guards on `updated_at`.
-    blocking(move || store.put_stats_block(&store_window, &raw, updated_at)).await?;
-    app.hub.broadcast_except(
-        Event::Stats(StatsBlock {
-            window: window.clone(),
-            updated_at,
-            json: value,
-        }),
-        origin,
-    );
-    Ok(Json(json!({ "ok": true, "window": window })))
+    let applied = blocking(move || store.put_stats_block(window, &raw, updated_at)).await?;
+    // A push the guard rejected is stale: fanning out the request body would
+    // stream a block older than the one every viewer already holds.
+    if applied {
+        app.hub.broadcast_except(
+            Event::Stats(StatsBlock {
+                window: window.as_str().to_string(),
+                updated_at,
+                json: value,
+            }),
+            origin,
+        );
+    }
+    Ok(Json(json!({ "ok": true, "window": window.as_str() })))
 }
 
 pub async fn post_note(
     State(app): State<AppState>,
     auth: RwAuth,
-    Json(body): Json<NoteBody>,
+    JsonBody(body): JsonBody<NoteBody>,
 ) -> ApiResult<Json<Value>> {
     let origin = auth.0.token.id;
     let store = app.store.clone();
@@ -242,6 +251,17 @@ pub async fn post_note(
     Ok(Json(json!({ "ok": true, "id": note.client_id })))
 }
 
+/// A body that overran the router's limit must answer 413, not 400: the photo
+/// upload is not queued, so a caller that reads it as a permanent client error
+/// discards the image instead of retrying it smaller.
+fn multipart_err(e: MultipartError) -> ApiError {
+    if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::PayloadTooLarge(e.body_text())
+    } else {
+        ApiError::BadRequest(e.to_string())
+    }
+}
+
 pub async fn post_photo(
     State(app): State<AppState>,
     auth: RwAuth,
@@ -252,17 +272,10 @@ pub async fn post_photo(
     let mut data: Option<Bytes> = None;
     let mut ext = String::from("jpg");
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(multipart_err)? {
         match field.name() {
             Some("ts") => {
-                let txt = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                let txt = field.text().await.map_err(multipart_err)?;
                 ts = txt.trim().parse().ok();
             }
             Some("image") | Some("file") | Some("photo") => {
@@ -271,12 +284,7 @@ pub async fn post_photo(
                         ext = e.to_lowercase();
                     }
                 }
-                data = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| ApiError::BadRequest(e.to_string()))?,
-                );
+                data = Some(field.bytes().await.map_err(multipart_err)?);
             }
             _ => {}
         }
@@ -296,7 +304,7 @@ pub async fn post_photo(
 pub async fn post_alert(
     State(app): State<AppState>,
     auth: RwAuth,
-    Json(body): Json<AlertBody>,
+    JsonBody(body): JsonBody<AlertBody>,
 ) -> ApiResult<Json<Value>> {
     let origin = auth.0.token.id;
     let store = app.store.clone();
@@ -321,7 +329,12 @@ pub async fn get_series(
     let store = app.store.clone();
     let rows =
         blocking(move || store.get_samples(&fields, q.from, q.to, q.limit, q.cursor)).await?;
-    let next = rows.last().map(|r| r.ts);
+    // A short page is the last one; advertising a cursor there costs the caller
+    // an extra round trip that can only come back empty.
+    let next = match q.limit {
+        Some(lim) if rows.len() < lim => None,
+        _ => rows.last().map(|r| r.ts),
+    };
     Ok(Json(json!({ "rows": rows, "next_cursor": next })))
 }
 
@@ -331,7 +344,7 @@ pub async fn get_meals(
     Query(q): Query<RangeQuery>,
 ) -> ApiResult<Json<Value>> {
     let store = app.store.clone();
-    let meals = blocking(move || store.get_meals(q.from, q.to)).await?;
+    let meals = blocking(move || store.get_meals(q.from, q.to, q.limit)).await?;
     Ok(Json(json!({ "meals": meals })))
 }
 
@@ -341,17 +354,20 @@ pub async fn get_doses(
     Query(q): Query<RangeQuery>,
 ) -> ApiResult<Json<Value>> {
     let store = app.store.clone();
-    let doses = blocking(move || store.get_doses(q.from, q.to)).await?;
+    let doses = blocking(move || store.get_doses(q.from, q.to, q.limit)).await?;
     Ok(Json(json!({ "doses": doses })))
 }
 
+/// The active schedule as a bare top-level object, or JSON `null` when none is
+/// active — no envelope key. The client decodes the body straight into its
+/// schedule type, and the `basal_schedule` stream frame inlines the same fields.
 pub async fn get_basal_schedule(
     State(app): State<AppState>,
     _auth: Auth,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<Option<BasalSchedule>>> {
     let store = app.store.clone();
     let schedule = blocking(move || store.get_basal_schedule()).await?;
-    Ok(Json(json!({ "basal_schedule": schedule })))
+    Ok(Json(schedule))
 }
 
 pub async fn get_predictions(
@@ -454,11 +470,17 @@ pub async fn get_model_file(
 ) -> ApiResult<Response> {
     let store = app.store.clone();
     let idc = id.clone();
-    let model = blocking(move || Ok(store.list_models()?.into_iter().find(|m| m.id == idc)))
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("model {id}")))?;
+    // `Model::path` is stored relative to the data dir; `model_path` rejoins
+    // the root, so the artifact is opened from an absolute path.
+    let (model, path) = blocking(move || {
+        let model = store.list_models()?.into_iter().find(|m| m.id == idc);
+        let path = store.model_path(&idc)?;
+        Ok(model.zip(path))
+    })
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("model {id}")))?;
 
-    let file = tokio::fs::File::open(&model.path)
+    let file = tokio::fs::File::open(&path)
         .await
         .map_err(|e| ApiError::NotFound(format!("model artifact unavailable: {e}")))?;
     let len = file
@@ -524,7 +546,7 @@ pub async fn get_stats(
 /// telemetry is never exposed to unauthenticated callers. Carries the
 /// `store_epoch` marker so the phone can detect a freshly-wiped/new server and
 /// re-mirror its authoritative history (§3.8).
-pub async fn get_health(State(app): State<AppState>, _auth: Auth) -> Json<Value> {
+pub async fn get_health(State(app): State<AppState>, _auth: Auth) -> ApiResult<Json<Value>> {
     let system = tokio::task::spawn_blocking(|| {
         use sysinfo::System;
         let mut sys = System::new();
@@ -545,58 +567,60 @@ pub async fn get_health(State(app): State<AppState>, _auth: Auth) -> Json<Value>
     .await
     .unwrap_or(Value::Null);
 
+    // A failed read must not surface as `null`: the phone reads `null` as "no
+    // marker" and silently skips the re-mirror until the next reconnect, so a
+    // read failure would look exactly like the one case the marker exists for.
     let store = app.store.clone();
-    let store_epoch = tokio::task::spawn_blocking(move || store.store_epoch().ok().flatten())
+    let store_epoch = blocking(move || store.store_epoch())
         .await
-        .ok()
-        .flatten();
+        .inspect_err(|e| tracing::warn!(error = %e, "health: store_epoch read failed"))?;
 
-    Json(json!({
+    Ok(Json(json!({
         "status": "ok",
-        "ws_clients": app.hub.receiver_count(),
+        // The TUI bridge holds one permanent in-process subscriber that is not a
+        // connected client; main.rs discounts it the same way for its own probe.
+        "ws_clients": app.hub.receiver_count().saturating_sub(1),
         "time_ms": store::now_ms(),
         "store_epoch": store_epoch,
         "system": system,
-    }))
+    })))
 }
 
 // ----- websocket ----------------------------------------------------------
 
+/// How often an upgraded stream re-checks that its token is still live. Auth
+/// is only resolved at upgrade time, so this bounds how long a revoked token
+/// keeps receiving events.
+const WS_LIVENESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn ws_stream(
     State(app): State<AppState>,
-    Query(q): Query<WsQuery>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    auth: WsAuth,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let secret = q.token;
-    let store = app.store.clone();
-    let token = match tokio::task::spawn_blocking(move || store.verify_secret(&secret)).await {
-        Ok(Ok(Some(t))) => t,
-        _ => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
-    };
-    let token_id = token.id;
-
-    // Register/refresh a session; it persists across WS reconnects. Auth on
-    // the socket rides the `?token=` query, not an Authorization header, so
-    // this cannot reuse the `Auth` extractor.
-    let ip = addr.ip().to_string();
-    let ua = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("websocket")
-        .to_string();
-    let store = app.store.clone();
-    let _ =
-        tokio::task::spawn_blocking(move || store.upsert_session(token_id, &ip, &ua, &ua)).await;
-
+    let token_id = auth.0.token.id;
     ws.on_upgrade(move |socket| ws_task(socket, app, token_id))
 }
 
 async fn ws_task(mut socket: WebSocket, app: AppState, token_id: i64) {
     let mut rx = app.hub.subscribe();
+    let mut liveness = tokio::time::interval_at(
+        tokio::time::Instant::now() + WS_LIVENESS_PERIOD,
+        WS_LIVENESS_PERIOD,
+    );
     loop {
         tokio::select! {
+            _ = liveness.tick() => {
+                let store = app.store.clone();
+                let live = blocking(move || {
+                    Ok(store.list_tokens(false)?.iter().any(|t| t.id == token_id))
+                })
+                .await;
+                // Fail closed: a revoked or unreadable token loses the stream.
+                if !matches!(live, Ok(true)) {
+                    break;
+                }
+            }
             recv = rx.recv() => {
                 match recv {
                     Ok(msg) => {
@@ -612,7 +636,16 @@ async fn ws_task(mut socket: WebSocket, app: AppState, token_id: i64) {
                             Err(_) => continue,
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // The buffer overran and events are already gone. Announce
+                    // the gap, then close: a reconnect re-pages the REST reads
+                    // from the client's own high-water marks, which is the only
+                    // way what was skipped comes back.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, token_id, "ws lagged; closing to force resync");
+                        let notice = json!({ "type": "lagged", "missed": missed }).to_string();
+                        let _ = socket.send(Message::Text(notice.into())).await;
+                        break;
+                    }
                     Err(_) => break,
                 }
             }

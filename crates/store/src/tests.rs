@@ -1,7 +1,8 @@
 //! Store unit/integration tests: migrations, the `one_rw` token invariant,
 //! six-scalar ingest→read roundtrips, the first-class meal/dose/basal-schedule
-//! curve events, phone-pushed stats blocks, and the `store_epoch` identity.
-//! Each test runs against a throwaway store rooted in a unique temp directory.
+//! curve events, prediction idempotency, phone-pushed stats blocks, and the
+//! `store_epoch` identity. Each test runs against a throwaway store rooted in a
+//! unique temp directory.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::json;
 
 use t1dm_core::{
-    BasalSchedule, BasalSlot, DoseEvent, DoseKind, IngestBundle, MealEvent, Series, TokenKind,
-    GRID_MS,
+    BasalSchedule, BasalSlot, DoseEvent, DoseKind, IngestBundle, MealEvent, PredictionWrite, Series,
+    StatsWindow, TokenKind, GRID_MS,
 };
 
 use crate::schema::LATEST_VERSION;
@@ -309,7 +310,7 @@ fn meal_event_roundtrips_and_upserts_on_newer() {
     assert_eq!(out[0], m, "the canonical row echoes the input verbatim");
 
     // Readable by range and by phone `client_id`.
-    assert_eq!(ts.get_meals(None, None).unwrap(), vec![m.clone()]);
+    assert_eq!(ts.get_meals(None, None, None).unwrap(), vec![m.clone()]);
     assert_eq!(ts.get_meal("meal-abc").unwrap(), Some(m.clone()));
 
     // A mixed/builder meal is stored only as its resolved appearance curve —
@@ -336,7 +337,7 @@ fn meal_event_roundtrips_and_upserts_on_newer() {
 
     // Idempotency: a redelivery (equal `updated_at`) is a no-op — no duplicate.
     ts.put_meals(std::slice::from_ref(&m)).unwrap();
-    assert_eq!(ts.get_meals(None, None).unwrap().len(), 2, "no duplicate row");
+    assert_eq!(ts.get_meals(None, None, None).unwrap().len(), 2, "no duplicate row");
 
     // A reordered stale redelivery (older `updated_at`) is rejected in place.
     let stale = MealEvent {
@@ -417,13 +418,13 @@ fn dose_event_roundtrips_bolus_and_basal_and_upserts_on_newer() {
         DoseKind::Basal
     );
     assert_eq!(
-        ts.get_doses(None, None).unwrap(),
+        ts.get_doses(None, None, None).unwrap(),
         vec![bolus.clone(), basal.clone()]
     );
 
     // Redelivery (equal `updated_at`) is a no-op; no duplicate rows.
     ts.put_doses(std::slice::from_ref(&bolus)).unwrap();
-    assert_eq!(ts.get_doses(None, None).unwrap().len(), 2);
+    assert_eq!(ts.get_doses(None, None, None).unwrap().len(), 2);
 
     // Stale (older `updated_at`) rejected; newer replaces in place.
     let stale = DoseEvent {
@@ -443,6 +444,123 @@ fn dose_event_roundtrips_bolus_and_basal_and_upserts_on_newer() {
     let got = ts.get_dose("dose-bolus").unwrap().unwrap();
     approx(got.units, 6.0);
     assert_eq!(got.updated_at, 2_000);
+}
+
+// ------------------------------------------------- curve-event read bounding
+
+#[test]
+fn curve_event_reads_bound_only_when_a_limit_is_asked_for() {
+    let ts = TempStore::new();
+    let meals: Vec<MealEvent> = (0..5)
+        .map(|i| MealEvent {
+            client_id: format!("meal-{i}"),
+            ts: grid_ts(i),
+            updated_at: 1_000 + i,
+            grams: 30.0,
+            duration_min: 180.0,
+            ..Default::default()
+        })
+        .collect();
+    ts.put_meals(&meals).unwrap();
+    let doses: Vec<DoseEvent> = (0..5)
+        .map(|i| DoseEvent {
+            client_id: format!("dose-{i}"),
+            ts: grid_ts(i),
+            updated_at: 1_000 + i,
+            kind: DoseKind::Bolus,
+            units: 2.0,
+            duration_min: 240.0,
+            ..Default::default()
+        })
+        .collect();
+    ts.put_doses(&doses).unwrap();
+
+    // No limit stays unbounded: the phone's desync-forced full resync asks for
+    // the whole history in one shot and does not page.
+    assert_eq!(ts.get_meals(None, None, None).unwrap().len(), 5);
+    assert_eq!(ts.get_doses(None, None, None).unwrap().len(), 5);
+
+    // A limit takes the oldest rows first, so the last `ts` of a page is the
+    // cursor the next one resumes from.
+    let page = ts.get_meals(None, None, Some(2)).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].ts, grid_ts(0));
+    assert_eq!(page[1].ts, grid_ts(1));
+    let next = ts.get_meals(Some(page[1].ts + 1), None, Some(2)).unwrap();
+    assert_eq!(next[0].ts, grid_ts(2));
+    assert_eq!(next[1].ts, grid_ts(3));
+
+    let dpage = ts.get_doses(None, None, Some(3)).unwrap();
+    assert_eq!(dpage.len(), 3);
+    assert_eq!(dpage[2].ts, grid_ts(2));
+
+    // A limit past the end neither errors nor pads; a zero limit yields nothing.
+    assert_eq!(ts.get_doses(None, None, Some(99)).unwrap().len(), 5);
+    assert!(ts.get_meals(None, None, Some(0)).unwrap().is_empty());
+
+    // The bound composes with the range rather than replacing it.
+    let ranged = ts
+        .get_meals(Some(grid_ts(1)), Some(grid_ts(3)), Some(2))
+        .unwrap();
+    assert_eq!(ranged.len(), 2);
+    assert_eq!(ranged[0].ts, grid_ts(1));
+}
+
+// ------------------------------------------------- curve-event grid discipline
+
+#[test]
+fn curve_events_reject_off_grid_timestamps_without_writing() {
+    let ts = TempStore::new();
+
+    let meal = MealEvent {
+        client_id: "meal-off".into(),
+        ts: grid_ts(1) + 1,
+        tz_offset: 0,
+        updated_at: 1_000,
+        grams: 30.0,
+        duration_min: 120.0,
+        gi: Some(0.5),
+        k: None,
+        theta: None,
+        custom_curve: None,
+        note: None,
+    };
+    assert!(matches!(
+        ts.put_meals(std::slice::from_ref(&meal)),
+        Err(crate::StoreError::OffGrid(_))
+    ));
+    assert!(ts.get_meals(None, None, None).unwrap().is_empty());
+
+    let dose = DoseEvent {
+        client_id: "dose-off".into(),
+        ts: grid_ts(1) - 1,
+        tz_offset: 0,
+        updated_at: 1_000,
+        kind: DoseKind::Bolus,
+        units: 3.0,
+        duration_min: 240.0,
+        k: Some(2.0),
+        theta: Some(25.0),
+        ka_per_hour: None,
+        ke_per_hour: None,
+        custom_curve: None,
+        note: None,
+    };
+    assert!(matches!(
+        ts.put_doses(std::slice::from_ref(&dose)),
+        Err(crate::StoreError::OffGrid(_))
+    ));
+    assert!(ts.get_doses(None, None, None).unwrap().is_empty());
+
+    // The rejection precedes the transaction, so an on-grid sibling batched with
+    // an off-grid row is not half-written.
+    let good_meal = MealEvent {
+        client_id: "meal-ok".into(),
+        ts: grid_ts(1),
+        ..meal.clone()
+    };
+    assert!(ts.put_meals(&[good_meal, meal]).is_err());
+    assert!(ts.get_meals(None, None, None).unwrap().is_empty());
 }
 
 // ------------------------------------------------------ basal schedule replace
@@ -512,6 +630,450 @@ fn basal_schedule_full_replace_keeps_one_active() {
     assert_eq!(live2.slots.len(), 1);
 }
 
+#[test]
+fn basal_schedule_reactivation_survives_unchanged_slots() {
+    let ts = TempStore::new();
+
+    let slot = |cid: &str, tod: i32| BasalSlot {
+        client_id: cid.into(),
+        label: format!("slot-{tod}"),
+        time_of_day_min: tod,
+        dose_u: 0.7,
+        duration_min: 180.0,
+        ka_per_hour: 1.0,
+        ke_per_hour: 0.4,
+        tz_offset: 0,
+        updated_at: 1_000,
+    };
+    let sched_a = BasalSchedule {
+        schedule_id: "sched-A".into(),
+        active: true,
+        slots: vec![slot("a1", 360), slot("a2", 720)],
+    };
+    let sched_b = BasalSchedule {
+        schedule_id: "sched-B".into(),
+        active: true,
+        slots: vec![slot("b1", 300)],
+    };
+    ts.put_basal_schedule(&sched_a).unwrap();
+    ts.put_basal_schedule(&sched_b).unwrap();
+
+    // Re-PUT A verbatim: every slot upsert no-ops on the `updated_at` guard, so
+    // A's activation has to be asserted outright — otherwise B is retired, A
+    // stays retired, and the scheduled basal silently vanishes.
+    let stored = ts.put_basal_schedule(&sched_a).unwrap();
+    assert!(stored.active);
+    assert_eq!(stored.slots.len(), 2);
+
+    let live = ts
+        .get_basal_schedule()
+        .unwrap()
+        .expect("a re-PUT of the live schedule keeps it live");
+    assert_eq!(live.schedule_id, "sched-A");
+    assert_eq!(live.slots.len(), 2);
+
+    let active_schedules: i64 = ts
+        .with_reader(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(DISTINCT schedule_id) FROM basal_schedule_dose WHERE active = 1",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(active_schedules, 1, "exactly one schedule stays active");
+
+    // Deactivating a schedule retires its rows without dropping them.
+    let retired = BasalSchedule {
+        active: false,
+        ..sched_a.clone()
+    };
+    let stored = ts.put_basal_schedule(&retired).unwrap();
+    assert!(!stored.active);
+    assert_eq!(stored.slots.len(), 2, "retiring keeps the slots");
+    assert!(ts.get_basal_schedule().unwrap().is_none());
+}
+
+#[test]
+fn basal_schedule_stale_redelivery_cannot_resurrect_a_retired_schedule() {
+    let ts = TempStore::new();
+
+    let slot = |cid: &str, tod: i32, updated_at: i64| BasalSlot {
+        client_id: cid.into(),
+        label: format!("slot-{tod}"),
+        time_of_day_min: tod,
+        dose_u: 0.7,
+        duration_min: 180.0,
+        ka_per_hour: 1.0,
+        ke_per_hour: 0.4,
+        tz_offset: 0,
+        updated_at,
+    };
+    let sched_a = BasalSchedule {
+        schedule_id: "sched-A".into(),
+        active: true,
+        slots: vec![slot("a1", 360, 1_000), slot("a2", 720, 1_000)],
+    };
+    let sched_b = BasalSchedule {
+        schedule_id: "sched-B".into(),
+        active: true,
+        slots: vec![slot("b1", 300, 2_000)],
+    };
+    ts.put_basal_schedule(&sched_a).unwrap();
+    ts.put_basal_schedule(&sched_b).unwrap();
+
+    // A queued retry of the superseded A lands late, and with one slot fewer
+    // than the stored A. Every slot upsert no-ops on the `updated_at` guard and
+    // A's version (its newest slot) predates B's, so the whole PUT is a no-op:
+    // the activation must not flip back to a schedule the phone has replaced.
+    let retry = BasalSchedule {
+        slots: vec![slot("a1", 360, 1_000)],
+        ..sched_a.clone()
+    };
+    let echoed = ts.put_basal_schedule(&retry).unwrap();
+    assert!(!echoed.active, "echoed as stored, not as sent");
+    assert_eq!(echoed.slots.len(), 2, "a stale replace drops no slot either");
+
+    let live = ts.get_basal_schedule().unwrap().unwrap();
+    assert_eq!(live.schedule_id, "sched-B");
+    assert_eq!(live.slots.len(), 1);
+
+    // A genuine phone-side edit of A (newer than B) does take activation back.
+    let revived = BasalSchedule {
+        slots: vec![slot("a1", 360, 3_000)],
+        ..sched_a.clone()
+    };
+    let stored = ts.put_basal_schedule(&revived).unwrap();
+    assert!(stored.active);
+    assert_eq!(stored.slots.len(), 1, "the newer replace does drop a2");
+    assert_eq!(
+        ts.get_basal_schedule().unwrap().unwrap().schedule_id,
+        "sched-A"
+    );
+}
+
+#[test]
+fn basal_stale_retry_cannot_prune_newer_slots_of_the_same_schedule() {
+    let ts = TempStore::new();
+
+    let slot = |cid: &str, tod: i32, updated_at: i64| BasalSlot {
+        client_id: cid.into(),
+        label: format!("slot-{tod}"),
+        time_of_day_min: tod,
+        dose_u: 0.8,
+        duration_min: 180.0,
+        ka_per_hour: 1.0,
+        ke_per_hour: 0.4,
+        tz_offset: 0,
+        updated_at,
+    };
+    let sched = |slots: Vec<BasalSlot>| BasalSchedule {
+        schedule_id: "sched-only".into(),
+        active: true,
+        slots,
+    };
+
+    // The phone keeps ONE stable schedule_id, so there is never a rival holding
+    // activation — the case a rival-only staleness check cannot see.
+    ts.put_basal_schedule(&sched(vec![slot("s1", 360, 1_000)]))
+        .unwrap();
+    let grown = ts
+        .put_basal_schedule(&sched(vec![
+            slot("s1", 360, 2_000),
+            slot("s2", 720, 2_000),
+            slot("s3", 1080, 2_000),
+        ]))
+        .unwrap();
+    assert_eq!(grown.slots.len(), 3);
+
+    // A queued retry of the superseded one-slot revision arrives late. Its slot
+    // upsert no-ops on the `updated_at` guard; the replace must not follow
+    // through and delete the two slots the phone has since added.
+    let echoed = ts
+        .put_basal_schedule(&sched(vec![slot("s1", 360, 1_000)]))
+        .unwrap();
+    assert_eq!(echoed.slots.len(), 3, "stale retry pruned newer slots");
+
+    let live = ts.get_basal_schedule().unwrap().unwrap();
+    assert_eq!(live.schedule_id, "sched-only");
+    assert_eq!(live.slots.len(), 3);
+    assert!(live.active);
+}
+
+#[test]
+fn basal_stale_replay_cannot_resurrect_a_slot_the_newer_put_deleted() {
+    let ts = TempStore::new();
+
+    let slot = |cid: &str, tod: i32, dose_u: f64, updated_at: i64| BasalSlot {
+        client_id: cid.into(),
+        label: format!("slot-{tod}"),
+        time_of_day_min: tod,
+        dose_u,
+        duration_min: 1440.0,
+        ka_per_hour: 0.30,
+        ke_per_hour: 0.07,
+        tz_offset: 0,
+        updated_at,
+    };
+    let sched = |slots: Vec<BasalSlot>| BasalSchedule {
+        schedule_id: "sched-S".into(),
+        active: true,
+        slots,
+    };
+
+    // Two slots at revision 1000; the user then deletes B and the revision-2000
+    // PUT (carrying A alone) drains first, pruning B.
+    ts.put_basal_schedule(&sched(vec![
+        slot("A", 360, 8.0, 1_000),
+        slot("B", 1320, 6.0, 1_000),
+    ]))
+    .unwrap();
+    let pruned = ts
+        .put_basal_schedule(&sched(vec![slot("A", 360, 8.0, 2_000)]))
+        .unwrap();
+    assert_eq!(pruned.slots.len(), 1);
+
+    // The backed-off revision-1000 PUT now redelivers. B no longer exists, so its
+    // upsert is an unguarded fresh INSERT — which must NOT be read as "this write
+    // landed, therefore it is current" and re-prune the schedule to the stale set.
+    let echoed = ts
+        .put_basal_schedule(&sched(vec![
+            slot("A", 360, 8.0, 1_000),
+            slot("B", 1320, 6.0, 1_000),
+        ]))
+        .unwrap();
+    assert_eq!(echoed.slots.len(), 1, "stale replay resurrected a deleted slot");
+
+    let live = ts.get_basal_schedule().unwrap().unwrap();
+    assert_eq!(live.slots.len(), 1);
+    assert_eq!(live.slots[0].client_id, "A");
+    assert_eq!(live.slots[0].updated_at, 2_000);
+    approx(live.slots[0].dose_u, 8.0);
+}
+
+// ------------------------------------------------- display reconstruction
+
+#[test]
+fn parametric_meal_gamma_is_derived_from_its_glycaemic_index() {
+    let ts = TempStore::new();
+
+    // A parametric meal with neither k/theta nor gi: the phone resolves its gamma
+    // through carbGammaForGi(DEFAULT_GI = 50) ⇒ (k 3.25, θ 22.5), peak (k-1)·θ =
+    // 50.6 min — NOT the invented (3.0, 20.0) whose peak is 40 min.
+    let meal = MealEvent {
+        client_id: "meal-gi".into(),
+        ts: grid_ts(0),
+        tz_offset: 0,
+        updated_at: 1_000,
+        grams: 60.0,
+        duration_min: 240.0,
+        gi: None,
+        k: None,
+        theta: None,
+        custom_curve: None,
+        note: None,
+    };
+    ts.put_meals(std::slice::from_ref(&meal)).unwrap();
+
+    let ch = ts.reconstruct_channels(grid_ts(0), grid_ts(60)).unwrap();
+    let total: f64 = ch.carb.iter().map(|(_, v)| v).sum();
+    approx(total, 60.0);
+    let (peak_ts, peak_v) = ch
+        .carb
+        .iter()
+        .cloned()
+        .fold((0i64, f64::MIN), |acc, p| if p.1 > acc.1 { p } else { acc });
+    assert_eq!(peak_ts, grid_ts(9), "carb appearance must peak at 50 min");
+    assert!((peak_v - 3.4246).abs() < 1e-3, "peak Ra {peak_v} g/step");
+
+    // An explicit GI overrides the default: GI 100 ⇒ (k 2.0, θ 15.0), peak 15 min.
+    let fast_store = TempStore::new();
+    let fast = MealEvent {
+        client_id: "meal-fast".into(),
+        gi: Some(100.0),
+        ..meal.clone()
+    };
+    fast_store.put_meals(std::slice::from_ref(&fast)).unwrap();
+    let ch = fast_store
+        .reconstruct_channels(grid_ts(0), grid_ts(60))
+        .unwrap();
+    let peak = ch
+        .carb
+        .iter()
+        .cloned()
+        .fold((0i64, f64::MIN), |acc, p| if p.1 > acc.1 { p } else { acc });
+    assert_eq!(peak.0, grid_ts(2), "GI 100 pulls the peak to 15 min");
+}
+
+#[test]
+fn bolus_without_both_gamma_params_falls_to_the_exp_action_kernel() {
+    let ts = TempStore::new();
+
+    let bolus = DoseEvent {
+        client_id: "dose-exp".into(),
+        ts: grid_ts(0),
+        tz_offset: 0,
+        updated_at: 1_000,
+        kind: DoseKind::Bolus,
+        units: 5.0,
+        duration_min: 360.0,
+        k: None,
+        theta: None,
+        ka_per_hour: None,
+        ke_per_hour: None,
+        custom_curve: None,
+        note: None,
+    };
+    ts.put_doses(std::slice::from_ref(&bolus)).unwrap();
+
+    let ch = ts.reconstruct_channels(grid_ts(0), grid_ts(100)).unwrap();
+    approx(ch.bolus.iter().map(|(_, v)| v).sum::<f64>(), 5.0);
+    let peak = ch
+        .bolus
+        .iter()
+        .cloned()
+        .fold((0i64, f64::MIN), |acc, p| if p.1 > acc.1 { p } else { acc });
+    assert_eq!(peak.0, grid_ts(14), "exp-action peaks at min(75, 0.4·DIA)");
+    // The first hour: 1.172 U under the exp-action kernel, 3.022 U under the
+    // gamma the port invented — the divergence that summed to the same 5.0 U.
+    let first_hour: f64 = ch
+        .bolus
+        .iter()
+        .filter(|(t, _)| *t <= grid_ts(11))
+        .map(|(_, v)| v)
+        .sum();
+    assert!((first_hour - 1.1718).abs() < 1e-3, "first-hour action {first_hour} U");
+
+    // BOTH params present ⇒ the stored gamma is honoured (peak (k-1)·θ = 50 min).
+    let gamma_store = TempStore::new();
+    gamma_store
+        .put_doses(std::slice::from_ref(&DoseEvent {
+            client_id: "dose-gamma".into(),
+            k: Some(3.0),
+            theta: Some(25.0),
+            ..bolus.clone()
+        }))
+        .unwrap();
+    let ch = gamma_store
+        .reconstruct_channels(grid_ts(0), grid_ts(100))
+        .unwrap();
+    let peak = ch
+        .bolus
+        .iter()
+        .cloned()
+        .fold((0i64, f64::MIN), |acc, p| if p.1 > acc.1 { p } else { acc });
+    assert_eq!(peak.0, grid_ts(9));
+
+    // Only one of the two ⇒ still exp-action, never a half-defaulted gamma.
+    let half_store = TempStore::new();
+    half_store
+        .put_doses(std::slice::from_ref(&DoseEvent {
+            client_id: "dose-half".into(),
+            k: Some(3.0),
+            theta: None,
+            ..bolus.clone()
+        }))
+        .unwrap();
+    let ch = half_store
+        .reconstruct_channels(grid_ts(0), grid_ts(100))
+        .unwrap();
+    let peak = ch
+        .bolus
+        .iter()
+        .cloned()
+        .fold((0i64, f64::MIN), |acc, p| if p.1 > acc.1 { p } else { acc });
+    assert_eq!(peak.0, grid_ts(14), "one of two params must not half-default");
+}
+
+// ---------------------------------------------------------------- predictions
+
+#[test]
+fn prediction_upserts_on_newer_and_rejects_stale_redelivery() {
+    let ts = TempStore::new();
+
+    let pred = PredictionWrite {
+        made_at: grid_ts(3),
+        model_id: "forecaster.pt".into(),
+        updated_at: 1_000,
+        horizon_steps: 3,
+        line: vec![120.0, 125.0, 130.0],
+        fan: vec![vec![110.0, 130.0], vec![112.0, 138.0], vec![115.0, 145.0]],
+        circadian: None,
+    };
+    let ids = ts.put_predictions(std::slice::from_ref(&pred)).unwrap();
+    assert_eq!(ids.len(), 1);
+
+    // A queued stale redelivery must not roll the forecast — or its
+    // `updated_at` — backwards, and still reports the canonical row id.
+    let stale = PredictionWrite {
+        updated_at: 500,
+        line: vec![999.0, 999.0, 999.0],
+        ..pred.clone()
+    };
+    assert_eq!(ts.put_predictions(std::slice::from_ref(&stale)).unwrap(), ids);
+    let got = ts.get_prediction_latest().unwrap().unwrap();
+    approx(got.line[0], 120.0);
+    assert_eq!(got.updated_at, 1_000);
+
+    // A genuine re-run of the same cycle (newer `updated_at`) replaces in place.
+    let newer = PredictionWrite {
+        updated_at: 2_000,
+        line: vec![140.0, 145.0, 150.0],
+        ..pred.clone()
+    };
+    assert_eq!(ts.put_predictions(std::slice::from_ref(&newer)).unwrap(), ids);
+    let got = ts.get_prediction_latest().unwrap().unwrap();
+    approx(got.line[0], 140.0);
+    assert_eq!(got.updated_at, 2_000);
+    assert_eq!(
+        ts.get_predictions(None, None).unwrap().len(),
+        1,
+        "idempotent on (made_at, model_id) — no duplicate row"
+    );
+}
+
+#[test]
+fn prediction_latest_tiebreaks_within_one_cycle_deterministically() {
+    let ts = TempStore::new();
+
+    // The phone pushes EVERY running model of a cycle in one batch, so several
+    // rows share one `made_at` (the table's identity is (made_at, model_id)).
+    // The wire carries no selection flag, so the server cannot pick the model the
+    // phone displays — but the pick must not vary between reads.
+    let pred = |model_id: &str, updated_at: i64, first: f64| PredictionWrite {
+        made_at: grid_ts(3),
+        model_id: model_id.into(),
+        updated_at,
+        horizon_steps: 2,
+        line: vec![first, first + 5.0],
+        fan: vec![vec![first - 10.0, first + 10.0], vec![first - 12.0, first + 12.0]],
+        circadian: None,
+    };
+    ts.put_predictions(&[
+        pred("alpha.pte", 1_000, 100.0),
+        pred("beta.pte", 1_000, 200.0),
+        pred("gamma.pte", 2_000, 300.0),
+    ])
+    .unwrap();
+
+    // Newest cycle, then newest write, then newest row: gamma.pte, every time.
+    for _ in 0..4 {
+        let got = ts.get_prediction_latest().unwrap().unwrap();
+        assert_eq!(got.model_id, "gamma.pte");
+        approx(got.line[0], 300.0);
+    }
+
+    // A newer cycle still wins outright, whatever the within-cycle stamps.
+    ts.put_predictions(&[PredictionWrite {
+        made_at: grid_ts(4),
+        ..pred("alpha.pte", 500, 400.0)
+    }])
+    .unwrap();
+    let got = ts.get_prediction_latest().unwrap().unwrap();
+    assert_eq!(got.made_at, grid_ts(4));
+    approx(got.line[0], 400.0);
+}
+
 // ------------------------------------------------------- phone-pushed stats
 
 #[test]
@@ -529,7 +1091,10 @@ fn stats_block_roundtrips_verbatim_and_upserts_on_newer() {
         "n_samples": 288
     })
     .to_string();
-    ts.put_stats_block("7d", &block, 1_000).unwrap();
+    assert!(
+        ts.put_stats_block(StatsWindow::D7, &block, 1_000).unwrap(),
+        "the first push lands"
+    );
     assert_eq!(
         ts.get_stats_block("7d").unwrap().as_deref(),
         Some(block.as_str())
@@ -537,7 +1102,9 @@ fn stats_block_roundtrips_verbatim_and_upserts_on_newer() {
 
     // A distinct window is stored independently and leaves 7d untouched.
     let block90 = json!({"window":"90d","tir":0.66}).to_string();
-    ts.put_stats_block("90d", &block90, 1_000).unwrap();
+    assert!(ts
+        .put_stats_block(StatsWindow::D90, &block90, 1_000)
+        .unwrap());
     assert_eq!(
         ts.get_stats_block("90d").unwrap().as_deref(),
         Some(block90.as_str())
@@ -548,14 +1115,18 @@ fn stats_block_roundtrips_verbatim_and_upserts_on_newer() {
     );
 
     // Idempotency: a redelivery (equal `updated_at`) is a no-op even with a
-    // different body; a stale one is likewise rejected.
+    // different body; a stale one is likewise rejected. The rejection is
+    // reported back, so the api layer can withhold the fan-out frame.
     let other = json!({"window":"7d","tir":0.0}).to_string();
-    ts.put_stats_block("7d", &other, 1_000).unwrap();
+    assert!(
+        !ts.put_stats_block(StatsWindow::D7, &other, 1_000).unwrap(),
+        "a redelivery reports that nothing landed"
+    );
     assert_eq!(
         ts.get_stats_block("7d").unwrap().as_deref(),
         Some(block.as_str())
     );
-    ts.put_stats_block("7d", &other, 500).unwrap();
+    assert!(!ts.put_stats_block(StatsWindow::D7, &other, 500).unwrap());
     assert_eq!(
         ts.get_stats_block("7d").unwrap().as_deref(),
         Some(block.as_str())
@@ -563,7 +1134,7 @@ fn stats_block_roundtrips_verbatim_and_upserts_on_newer() {
 
     // A newer `updated_at` replaces the block verbatim.
     let newer = json!({"window":"7d","tir":0.80,"n_samples":300}).to_string();
-    ts.put_stats_block("7d", &newer, 2_000).unwrap();
+    assert!(ts.put_stats_block(StatsWindow::D7, &newer, 2_000).unwrap());
     assert_eq!(
         ts.get_stats_block("7d").unwrap().as_deref(),
         Some(newer.as_str())
@@ -631,6 +1202,22 @@ fn photo_write_read_and_teardown_clears_them() {
     assert_eq!(std::fs::read(&path).unwrap(), data);
     assert_eq!(ts.get_photos(None, None).unwrap().len(), 1);
 
+    // Identity is the ATTACHMENT, `(sha256, ts)`: an exact re-POST is idempotent,
+    // but the same saved image attached to a later meal is its own event. The
+    // phone mints no photo id and discards the ack, so a collapse here is
+    // invisible to it and hangs the photo on the wrong meal.
+    let again = ts.add_photo(grid_ts(0), data, 16, 9, "png").unwrap();
+    assert_eq!(again.id, p.id, "an exact re-POST stays idempotent");
+    assert_eq!(ts.get_photos(None, None).unwrap().len(), 1);
+
+    let later = ts.add_photo(grid_ts(132), data, 16, 9, "png").unwrap();
+    assert_ne!(later.id, p.id, "a second attachment is a distinct row");
+    assert_eq!(later.ts, grid_ts(132));
+    assert_eq!(later.path, p.path, "both rows share the content-addressed file");
+    let listed = ts.get_photos(None, None).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].ts, grid_ts(132), "newest first");
+
     ts.teardown().unwrap();
     assert!(ts.get_photos(None, None).unwrap().is_empty());
     assert!(!path.exists(), "teardown clears the photos dir");
@@ -695,7 +1282,12 @@ fn refresh_models_hashes_and_preserves_opaque_meta() {
         ts.get_model_meta("forecaster.pt").unwrap(),
         Some(json!({"arch":"lstm","layers":2}))
     );
-    assert!(ts.model_path("forecaster.pt").unwrap().is_some());
+    // The served `path` is documented as relative to `storage.data_dir`, so the
+    // registry never hands a read-only client the appliance's fs layout.
+    assert_eq!(m.path, "models/forecaster.pt");
+    let abs = ts.model_path("forecaster.pt").unwrap().expect("resolved path");
+    assert!(abs.starts_with(&ts.dir), "the download path rejoins data_dir");
+    assert_eq!(std::fs::read(&abs).unwrap(), weights);
     assert!(ts.get_model_meta("absent").unwrap().is_none());
 
     // Re-scan is idempotent (upsert on id), still one row.
@@ -732,6 +1324,79 @@ fn refresh_models_registers_any_extension_and_skips_sidecars() {
     // Both variants remain fetchable by their distinct ids.
     assert!(ts.model_path("net.pt").unwrap().is_some());
     assert!(ts.model_path("net.onnx").unwrap().is_some());
+}
+
+#[test]
+fn refresh_models_reads_the_client_descriptor_sidecar() {
+    let ts = TempStore::new();
+    let dir = ts.models_dir();
+    // The phone writes and consumes `<name>.descriptor.json`, so a descriptor
+    // carried over from its models directory must be found — otherwise the row is
+    // served with `meta: null` and the phone skips the artifact entirely.
+    std::fs::write(dir.join("large-real.xnnpack.pte"), b"executorch").unwrap();
+    std::fs::write(
+        dir.join("large-real.xnnpack.descriptor.json"),
+        json!({"engine":"executorch","normalization_stats":{"bg_mean":140.0}}).to_string(),
+    )
+    .unwrap();
+
+    let models = ts.refresh_models(&dir).unwrap();
+    assert_eq!(models.len(), 1, "the descriptor sidecar is not an artifact");
+    assert_eq!(models[0].id, "large-real.xnnpack.pte");
+    assert_eq!(
+        models[0].meta,
+        json!({"engine":"executorch","normalization_stats":{"bg_mean":140.0}})
+    );
+
+    // The server's own `<stem>.json` spelling still resolves, and the client
+    // spelling wins when both are present.
+    std::fs::write(dir.join("plain.pte"), b"weights").unwrap();
+    std::fs::write(dir.join("plain.json"), json!({"src":"server"}).to_string()).unwrap();
+    std::fs::write(dir.join("both.pte"), b"weights").unwrap();
+    std::fs::write(dir.join("both.json"), json!({"src":"server"}).to_string()).unwrap();
+    std::fs::write(
+        dir.join("both.descriptor.json"),
+        json!({"src":"client"}).to_string(),
+    )
+    .unwrap();
+
+    let models = ts.refresh_models(&dir).unwrap();
+    assert_eq!(models.len(), 3);
+    let meta_of = |id: &str| models.iter().find(|m| m.id == id).unwrap().meta.clone();
+    assert_eq!(meta_of("plain.pte"), json!({"src":"server"}));
+    assert_eq!(meta_of("both.pte"), json!({"src":"client"}));
+}
+
+#[test]
+fn refresh_models_prunes_rows_whose_artifact_is_gone() {
+    let ts = TempStore::new();
+    let dir = ts.models_dir();
+    std::fs::write(dir.join("old.pte"), b"retired").unwrap();
+    std::fs::write(dir.join("old.json"), json!({"arch":"risk-v2"}).to_string()).unwrap();
+    std::fs::write(dir.join("new.pte"), b"current").unwrap();
+    assert_eq!(ts.refresh_models(&dir).unwrap().len(), 2);
+
+    // Retiring a model is a file deletion; the registry must mirror it, or the
+    // row keeps advertising a /download that 404s.
+    std::fs::remove_file(dir.join("old.pte")).unwrap();
+    std::fs::remove_file(dir.join("old.json")).unwrap();
+    let models = ts.refresh_models(&dir).unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "new.pte");
+    assert!(ts.model_path("old.pte").unwrap().is_none());
+    assert!(ts.get_model_meta("old.pte").unwrap().is_none());
+}
+
+#[test]
+fn refresh_models_leaves_registry_alone_when_dir_is_absent() {
+    let ts = TempStore::new();
+    let dir = ts.models_dir();
+    std::fs::write(dir.join("net.pte"), b"weights").unwrap();
+    assert_eq!(ts.refresh_models(&dir).unwrap().len(), 1);
+
+    // An unmounted / not-yet-created models dir must not be read as "every
+    // model was retired".
+    assert_eq!(ts.refresh_models(&dir.join("not-here")).unwrap().len(), 1);
 }
 
 // ------------------------------------------------------------ sessions

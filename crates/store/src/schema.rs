@@ -3,7 +3,7 @@
 
 use rusqlite::Connection;
 
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 
 /// PRAGMAs applied to every connection (writer and pooled readers).
 pub const CONNECTION_PRAGMAS: &str = "\
@@ -183,7 +183,10 @@ pub const LATEST_VERSION: i64 = 1;
 /// All migrations in ascending version order.
 const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_V1)];
 
-/// Run all outstanding migrations against `conn`. Idempotent.
+/// Run all outstanding migrations against `conn`. Idempotent. Afterwards the
+/// recorded head must have reached [`LATEST_VERSION`] — a bumped constant with
+/// no matching entry in `MIGRATIONS` would otherwise leave the store silently
+/// short of the schema every caller assumes.
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -200,6 +203,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         )
         .unwrap_or(0);
 
+    let mut head = current;
     for &(version, sql) in MIGRATIONS {
         if current < version {
             conn.execute_batch(sql)?;
@@ -208,8 +212,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 (version, crate::now_ms()),
             )?;
         }
+        head = head.max(version);
     }
 
+    if head < LATEST_VERSION {
+        return Err(StoreError::Invalid(format!(
+            "schema head {head} short of LATEST_VERSION {LATEST_VERSION}: a migration is missing"
+        )));
+    }
     Ok(())
 }
 

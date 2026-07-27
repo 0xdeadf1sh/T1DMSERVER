@@ -4,7 +4,9 @@
 //! pagination, the first-class meal/dose/basal-schedule/prediction/stats
 //! curve-event endpoints (round-trip, verbatim phone `updated_at`, idempotent
 //! upsert-on-newer), every write fanning out to every session *except* its
-//! origin token, the phone-pushed statistics block served verbatim, and
+//! origin token, the phone-pushed statistics block served verbatim, the
+//! rejection of unreachable stats windows and off-grid timestamps as 400, a
+//! transport-truncated body answering 500 rather than a droppable 400, and
 //! `GET /v1/health` carrying the `store_epoch` re-mirror marker.
 
 use axum::body::{to_bytes, Body};
@@ -75,6 +77,26 @@ fn get_req(uri: &str, secret: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// A well-formed RFC 6455 handshake, carrying the `ConnectInfo` the router
+/// normally gets from `into_make_service_with_connect_info`. The upgrade
+/// headers must be valid or the `WebSocketUpgrade` extractor rejects before the
+/// handler's own token check ever runs.
+fn ws_req(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            4242,
+        ))))
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn body_req(method: &str, uri: &str, secret: &str, body: &str) -> Request<Body> {
     Request::builder()
         .method(method)
@@ -82,6 +104,31 @@ fn body_req(method: &str, uri: &str, secret: &str, body: &str) -> Request<Body> 
         .header(header::AUTHORIZATION, format!("Bearer {secret}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// A request whose body stream errors part-way through, as a dropped link
+/// does: `prefix` arrives, then the transport faults. Distinct from a body the
+/// caller got wrong — nothing about the request is correctable.
+fn truncated_body_req(
+    method: &str,
+    uri: &str,
+    secret: &str,
+    prefix: &'static str,
+) -> Request<Body> {
+    let chunks = futures::stream::iter(vec![
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(prefix.as_bytes())),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "link flapped mid-body",
+        )),
+    ]);
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {secret}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(chunks))
         .unwrap()
 }
 
@@ -296,6 +343,30 @@ async fn pagination_cursor() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["ts"], json!(grid_ts(2)));
     assert_eq!(rows[1]["ts"], json!(grid_ts(3)));
+
+    // Page 3 is short, so it ends the walk rather than costing the caller one
+    // more round trip that could only come back empty.
+    let cursor = v["next_cursor"].as_i64().unwrap();
+    let resp = app(ts.store.clone())
+        .oneshot(get_req(
+            &format!("/v1/series?fields=bg&limit=2&cursor={cursor}"),
+            &rw,
+        ))
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(v["next_cursor"], Value::Null);
+
+    // Without an explicit `limit` the cursor still trails the last row: the
+    // store's own default bound is invisible here and must not be guessed at.
+    let resp = app(ts.store.clone())
+        .oneshot(get_req("/v1/series?fields=bg", &rw))
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v["rows"].as_array().unwrap().len(), 5);
+    assert_eq!(v["next_cursor"], json!(grid_ts(4)));
 }
 
 #[tokio::test]
@@ -401,6 +472,111 @@ async fn meals_roundtrip_and_fanout() {
     assert_eq!(m["gi"], json!(1.0));
     assert_eq!(m["updated_at"], json!(phone_clock(5)));
     assert!(m.get("received_at").is_none());
+    // An unbounded read advertises no continuation.
+    assert_eq!(v["next_cursor"], Value::Null);
+}
+
+#[tokio::test]
+async fn meals_and_doses_page_on_limit() {
+    let ts = temp_store();
+    let (_rw, rw) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+
+    let meals: Vec<Value> = (0..3)
+        .map(|i| {
+            json!({"client_id": format!("meal-p{i}"), "ts": grid_ts(i), "tz_offset": 0,
+                   "updated_at": phone_clock(i), "grams": 30.0, "duration_min": 180.0,
+                   "gi": 1.0, "k": 2.0, "theta": 3.0})
+        })
+        .collect();
+    let resp = app(ts.store.clone())
+        .oneshot(body_req(
+            "PUT",
+            "/v1/meals",
+            &rw,
+            &json!(meals).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let doses: Vec<Value> = (0..3)
+        .map(|i| {
+            json!({"client_id": format!("dose-p{i}"), "ts": grid_ts(i), "tz_offset": 0,
+                   "updated_at": phone_clock(i), "kind": "bolus", "units": 4.5,
+                   "duration_min": 300.0, "k": 2.0, "theta": 40.0})
+        })
+        .collect();
+    let resp = app(ts.store.clone())
+        .oneshot(body_req(
+            "PUT",
+            "/v1/doses",
+            &rw,
+            &json!(doses).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // `limit` caps the rows and nothing more: these endpoints advertise no
+    // cursor, because `ts` is not unique on the event tables and a ts-keyed
+    // continuation would either repeat or skip the rows sharing a boundary slot.
+    let resp = app(ts.store.clone())
+        .oneshot(get_req("/v1/meals?limit=2", &rw))
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v["meals"].as_array().unwrap().len(), 2);
+    assert_eq!(v.get("next_cursor"), None);
+
+    let resp = app(ts.store.clone())
+        .oneshot(get_req("/v1/doses?limit=2", &rw))
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v["doses"].as_array().unwrap().len(), 2);
+    assert_eq!(v.get("next_cursor"), None);
+
+    // Absent `limit` is the whole range.
+    let resp = app(ts.store.clone())
+        .oneshot(get_req("/v1/doses", &rw))
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert_eq!(v["doses"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn meals_sharing_one_grid_slot_are_all_returned() {
+    let ts = temp_store();
+    let (_rw, rw) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+
+    // Two foods logged in the same five-minute slot: ordinary, and the reason a
+    // `ts` cursor cannot page these tables without losing one of them.
+    let meals: Vec<Value> = (0..2)
+        .map(|i| {
+            json!({"client_id": format!("same-slot-{i}"), "ts": grid_ts(0), "tz_offset": 0,
+                   "updated_at": phone_clock(i), "grams": 20.0 + i as f64, "duration_min": 180.0})
+        })
+        .collect();
+    let resp = app(ts.store.clone())
+        .oneshot(body_req(
+            "PUT",
+            "/v1/meals",
+            &rw,
+            &json!(meals).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app(ts.store.clone())
+        .oneshot(get_req("/v1/meals", &rw))
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    let rows = v["meals"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["ts"], rows[1]["ts"]);
 }
 
 #[tokio::test]
@@ -575,8 +751,10 @@ async fn basal_schedule_replace_and_fanout() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // The body IS the schedule object — no envelope key; the client decodes
+    // the top level straight into its non-defaulted schedule type.
     let v = body_json(resp).await;
-    let sched = &v["basal_schedule"];
+    let sched = &v;
     assert_eq!(sched["schedule_id"], json!("sched-B"));
     let slots = sched["slots"].as_array().expect("slots array");
     assert_eq!(slots.len(), 1);
@@ -584,6 +762,22 @@ async fn basal_schedule_replace_and_fanout() {
     assert_eq!(slots[0]["dose_u"], json!(1.2));
     assert_eq!(slots[0]["updated_at"], json!(phone_clock(3)));
     assert!(slots[0].get("received_at").is_none());
+}
+
+#[tokio::test]
+async fn basal_schedule_absent_is_null_body() {
+    let ts = temp_store();
+    let (_rw, rw) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+
+    // No active schedule is a bare `null` at 200, not a 404 and not `{}` —
+    // the client's contract reads the top-level body as the schedule itself.
+    let resp = app(ts.store.clone())
+        .oneshot(get_req("/v1/basal-schedule", &rw))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"null");
 }
 
 #[tokio::test]
@@ -803,6 +997,270 @@ async fn stats_upsert_on_newer() {
 }
 
 #[tokio::test]
+async fn stale_stats_push_is_not_broadcast() {
+    let ts = temp_store();
+    let (_rw, rw) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+
+    let hub = WsHub::new(64);
+    let mut sub = hub.subscribe();
+
+    let push = |updated_at: i64, tir: f64| {
+        json!({"window": "7d", "updated_at": updated_at, "tir": tir}).to_string()
+    };
+
+    let resp = app_on(&ts.store, &hub)
+        .oneshot(body_req("PUT", "/v1/stats", &rw, &push(phone_clock(10), 0.72)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    match sub.recv().await.expect("hub message").event {
+        Event::Stats(s) => assert_eq!(s.json["tir"], json!(0.72)),
+        other => panic!("expected Stats event, got {other:?}"),
+    }
+
+    // A push the store's guard rejected must not fan out: the request body is
+    // older than the block every viewer already holds. The handler broadcasts
+    // before responding, so an empty channel here is decisive.
+    let resp = app_on(&ts.store, &hub)
+        .oneshot(body_req("PUT", "/v1/stats", &rw, &push(phone_clock(9), 0.10)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(sub.try_recv().is_err(), "stale push must not fan out");
+
+    // The next genuine edit still does.
+    let resp = app_on(&ts.store, &hub)
+        .oneshot(body_req("PUT", "/v1/stats", &rw, &push(phone_clock(20), 0.90)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    match sub.recv().await.expect("hub message").event {
+        Event::Stats(s) => assert_eq!(s.json["tir"], json!(0.90)),
+        other => panic!("expected Stats event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stats_unknown_window_is_rejected() {
+    let ts = temp_store();
+    let (_rw, rw) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+
+    // A label no reader can parse: every read goes through `StatsWindow`,
+    // which knows only 7d/30d/90d.
+    let block = json!({"window": "7D", "updated_at": phone_clock(10), "tir": 0.72}).to_string();
+    let resp = app(ts.store.clone())
+        .oneshot(body_req("PUT", "/v1/stats", &rw, &block))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Nothing was written — neither an unreachable row under the junk label
+    // nor a normalized one under the canonical spelling.
+    assert!(ts.store.get_stats_block("7D").unwrap().is_none());
+    assert!(ts.store.get_stats_block("7d").unwrap().is_none());
+    assert_eq!(stats_tir(ts.store.clone(), &rw).await, json!(0.0));
+}
+
+#[tokio::test]
+async fn off_grid_timestamp_is_bad_request() {
+    let ts = temp_store();
+    let (_rw, rw) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+
+    // One millisecond off the five-minute grid: a caller-correctable input,
+    // so 400 — not a 500 the client would retry with backoff forever.
+    let off = grid_ts(5) + 1;
+
+    let body =
+        json!({"ts": off, "tz_offset": 0, "updated_at": phone_clock(5), "bg": 100.0}).to_string();
+    let resp = app(ts.store.clone())
+        .oneshot(body_req("POST", "/v1/ingest", &rw, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // The message names the offending timestamp.
+    let v = body_json(resp).await;
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&off.to_string()),
+        "error must name the timestamp: {v}"
+    );
+
+    let body = json!([{
+        "client_id": "meal-off", "ts": off, "tz_offset": 0, "updated_at": phone_clock(5),
+        "grams": 30.0, "duration_min": 180.0, "gi": 1.0, "k": 2.0, "theta": 3.0
+    }])
+    .to_string();
+    let resp = app(ts.store.clone())
+        .oneshot(body_req("PUT", "/v1/meals", &rw, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = json!([{
+        "client_id": "dose-off", "ts": off, "tz_offset": 0, "updated_at": phone_clock(5),
+        "kind": "bolus", "units": 4.5, "duration_min": 300.0, "k": 2.0, "theta": 40.0
+    }])
+    .to_string();
+    let resp = app(ts.store.clone())
+        .oneshot(body_req("PUT", "/v1/doses", &rw, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A rejected batch writes nothing.
+    let resp = app(ts.store.clone())
+        .oneshot(get_req(
+            &format!("/v1/meals?from={}&to={}", grid_ts(0), grid_ts(10)),
+            &rw,
+        ))
+        .await
+        .unwrap();
+    let v = body_json(resp).await;
+    assert!(v["meals"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_body_is_bad_request_in_the_error_envelope() {
+    let ts = temp_store();
+    let (_rw, rw) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+
+    // Syntactically broken JSON.
+    let resp = app(ts.store.clone())
+        .oneshot(body_req("POST", "/v1/ingest", &rw, "{not json"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(resp).await;
+    assert!(v["error"].is_string(), "envelope, not plain text: {v}");
+
+    // Well-formed JSON missing a required field — 400, not axum's bare 422.
+    let body = json!({"tz_offset": 0, "updated_at": phone_clock(0), "bg": 100.0}).to_string();
+    let resp = app(ts.store.clone())
+        .oneshot(body_req("POST", "/v1/ingest", &rw, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(body_json(resp).await["error"].is_string());
+
+    // No `Content-Type` — 400, not axum's bare 415.
+    let body = json!([{
+        "client_id": "meal-ct", "ts": grid_ts(0), "tz_offset": 0, "updated_at": phone_clock(0),
+        "grams": 30.0, "duration_min": 180.0, "gi": 1.0, "k": 2.0, "theta": 3.0
+    }])
+    .to_string();
+    let resp = app(ts.store.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/meals")
+                .header(header::AUTHORIZATION, format!("Bearer {rw}"))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(body_json(resp).await["error"].is_string());
+}
+
+#[tokio::test]
+async fn oversized_body_is_payload_too_large_in_the_error_envelope() {
+    let ts = temp_store();
+    let (_rw, rw) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+
+    // One byte past the router's ceiling: 413 inside the envelope, not the
+    // bare plain-text rejection axum would emit on its own.
+    let mut body = String::from("\"");
+    body.push_str(&"x".repeat(crate::MAX_BODY_BYTES));
+    body.push('"');
+    let resp = app(ts.store.clone())
+        .oneshot(body_req("POST", "/v1/ingest", &rw, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(body_json(resp).await["error"].is_string());
+
+    // A body comfortably over axum's own 2 MiB default is accepted.
+    let filler = "y".repeat(3 * 1024 * 1024);
+    let body = json!({
+        "client_id": "note-big", "ts": grid_ts(0), "tz_offset": 0,
+        "text": filler, "updated_at": phone_clock(0)
+    })
+    .to_string();
+    let resp = app(ts.store.clone())
+        .oneshot(body_req("POST", "/v1/notes", &rw, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn stream_rejects_in_the_error_envelope() {
+    let ts = temp_store();
+
+    // No `?token=` at all is an unauthenticated request, not a malformed one.
+    let resp = app(ts.store.clone())
+        .oneshot(ws_req("/v1/stream"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["error"], json!("unauthorized"));
+
+    // A token nothing minted is rejected the same way.
+    let resp = app(ts.store.clone())
+        .oneshot(ws_req("/v1/stream?token=deadbeefdeadbeef"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["error"], json!("unauthorized"));
+}
+
+#[tokio::test]
+async fn body_stream_that_faults_mid_transfer_is_retryable_not_a_permanent_drop() {
+    let ts = temp_store();
+    let (_rw, rw) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+
+    // A 6.0 U bolus whose upload is cut off in flight. The client drops any
+    // 4xx row from its outbox permanently and retries any 5xx, so answering
+    // 400 here would delete a clinical record over a dropped packet.
+    let resp = app(ts.store.clone())
+        .oneshot(truncated_body_req(
+            "PUT",
+            "/v1/doses",
+            &rw,
+            r#"[{"client_id":"d-flap","ts":"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    // The raw-body route reaches the same fault through the same extractor.
+    let resp = app(ts.store.clone())
+        .oneshot(truncated_body_req(
+            "PUT",
+            "/v1/stats",
+            &rw,
+            r#"{"window":"7d","updated_at":"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Nothing half-landed, so the client's retry is a clean first write.
+    let resp = app(ts.store.clone())
+        .oneshot(get_req(
+            &format!("/v1/doses?from={}&to={}", grid_ts(0), grid_ts(10)),
+            &rw,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["doses"], json!([]));
+    assert!(ts.store.get_stats_block("7d").unwrap().is_none());
+}
+
+#[tokio::test]
 async fn health_requires_auth() {
     let ts = temp_store();
     let (_ro, ro_secret) = ts
@@ -836,6 +1294,51 @@ async fn health_requires_auth() {
     assert!(
         v.get("store_epoch").is_some() && !v["store_epoch"].is_null(),
         "health must carry a non-null store_epoch"
+    );
+}
+
+#[tokio::test]
+async fn health_store_epoch_is_the_stores_own_marker_and_turns_over_on_wipe() {
+    let ts = temp_store();
+    let (_ro, ro) = ts.store.mint_token(TokenKind::Ro, None).unwrap();
+
+    // The phone compares this string against the last epoch it fully mirrored,
+    // so health must echo the stored marker exactly — not a re-derivation.
+    let minted = ts.store.store_epoch().unwrap().unwrap();
+    let resp = app(ts.store.clone())
+        .oneshot(get_req("/v1/health", &ro))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["store_epoch"], json!(minted));
+
+    // A wipe mints a new one, which is the sole signal that drives the phone's
+    // H7 re-mirror of its authoritative history.
+    ts.store.teardown().unwrap();
+    let (_ro2, ro2) = ts.store.mint_token(TokenKind::Ro, None).unwrap();
+    let wiped = ts.store.store_epoch().unwrap().unwrap();
+    assert_ne!(wiped, minted);
+    let resp = app(ts.store.clone())
+        .oneshot(get_req("/v1/health", &ro2))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["store_epoch"], json!(wiped));
+}
+
+#[test]
+fn store_read_failure_is_a_500_not_a_health_null() {
+    use axum::response::IntoResponse;
+
+    // `get_health` now propagates the epoch read with `?`. A failed read must
+    // reach the phone as a 500 it retries, never as the `null` its re-mirror
+    // gate reads as "no marker" and skips until the next reconnect.
+    let e = crate::error::ApiError::from(store::StoreError::Io(std::io::Error::other(
+        "read pool exhausted",
+    )));
+    assert_eq!(
+        e.into_response().status(),
+        StatusCode::INTERNAL_SERVER_ERROR
     );
 }
 

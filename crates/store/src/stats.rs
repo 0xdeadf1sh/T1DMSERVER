@@ -9,12 +9,16 @@
 
 use rusqlite::OptionalExtension;
 
+use t1dm_core::StatsWindow;
+
 use crate::error::Result;
 use crate::{now_ms, Store};
 
 impl Store {
     /// Upsert the phone-pushed stats block for `window`, storing `json`
-    /// verbatim.
+    /// verbatim. Taking a [`StatsWindow`] rather than free text keeps the
+    /// primary key inside the set readers can parse back, so no unreachable
+    /// row is representable.
     ///
     /// Idempotent on `window` and monotone in the phone clock: a byte-identical
     /// redelivery (equal `updated_at`) or a reordered stale redelivery (older
@@ -22,10 +26,18 @@ impl Store {
     /// replaces in place. `updated_at` is stored exactly as sent; `received_at`
     /// is the server's internal arrival stamp and is not serialized on any wire
     /// shape.
-    pub fn put_stats_block(&self, window: &str, json: &str, updated_at: i64) -> Result<()> {
+    ///
+    /// Returns whether the write landed — `false` when the guard rejected it —
+    /// so the api layer does not fan out a frame for a block the store refused.
+    pub fn put_stats_block(
+        &self,
+        window: StatsWindow,
+        json: &str,
+        updated_at: i64,
+    ) -> Result<bool> {
         let received_at = now_ms();
         self.with_writer(|conn| {
-            conn.execute(
+            let n = conn.execute(
                 "INSERT INTO stats_block(window, json, updated_at, received_at)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(window) DO UPDATE SET
@@ -33,9 +45,9 @@ impl Store {
                     updated_at  = excluded.updated_at,
                     received_at = excluded.received_at
                  WHERE excluded.updated_at > stats_block.updated_at",
-                (window, json, updated_at, received_at),
+                (window.as_str(), json, updated_at, received_at),
             )?;
-            Ok(())
+            Ok(n > 0)
         })
     }
 

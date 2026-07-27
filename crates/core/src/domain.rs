@@ -301,8 +301,10 @@ pub struct Model {
     pub name: String,
     /// Artifact filename extension (lowercased, no dot), e.g. `pt`, `onnx`,
     /// `tflite`. Empty when the file has none. Lets a consumer know the format
-    /// without parsing the server-local `path`.
+    /// without parsing the `path`.
     pub ext: String,
+    /// Artifact location relative to `storage.data_dir` (`models/<file>`), so
+    /// the appliance's filesystem layout stays off the wire.
     pub path: String,
     pub meta: Value,
     pub sha256: String,
