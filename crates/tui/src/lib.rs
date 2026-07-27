@@ -15,6 +15,7 @@ pub mod theme;
 pub mod widgets;
 
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -47,6 +48,12 @@ enum LoopMsg {
 pub type Result<T = ()> =
     std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
+/// How many clients are attached to the WS stream right now. The TUI does not
+/// depend on the api crate, so the root binary supplies a closure over the
+/// hub's subscriber count — already discounted by the one permanent in-process
+/// subscriber the event bridge holds.
+pub type ClientProbe = Arc<dyn Fn() -> usize + Send + Sync>;
+
 /// A data event pushed from the server side into the TUI. The root binary
 /// maps `api::Event` onto this so the TUI need not depend on `api`.
 #[derive(Debug, Clone)]
@@ -56,16 +63,25 @@ pub enum AppEvent {
     Note(Note),
     Photo(Photo),
     Alert(Alert),
+    /// A store write that carries no footer indicator of its own (meal, dose,
+    /// basal schedule, stats block). Rendering is demand-driven, so without a
+    /// wake-up a non-animating layout would keep serving the pre-write frame.
+    StoreChanged,
 }
 
 /// Run the TUI to completion. Initializes the terminal (raw mode, alternate
 /// screen, mouse capture), drives the event loop, and restores on exit —
 /// even on error.
-pub fn run(store: Store, cfg: Config, rx: broadcast::Receiver<AppEvent>) -> Result<()> {
+pub fn run(
+    store: Store,
+    cfg: Config,
+    rx: broadcast::Receiver<AppEvent>,
+    clients: ClientProbe,
+) -> Result<()> {
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
 
-    let result = run_loop(&mut terminal, store, cfg, rx);
+    let result = run_loop(&mut terminal, store, cfg, rx, clients);
 
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
@@ -77,10 +93,11 @@ fn run_loop(
     store: Store,
     cfg: Config,
     rx: broadcast::Receiver<AppEvent>,
+    clients: ClientProbe,
 ) -> Result<()> {
     let show_boot = cfg.ui.show_boot;
     let fps = cfg.ui.fps;
-    let mut app = App::new(store, cfg);
+    let mut app = App::new(store, cfg, clients);
 
     // Both event sources block, so each is bridged onto a single channel by a
     // dedicated thread. The render loop then waits on one queue and can wake

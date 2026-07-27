@@ -32,6 +32,10 @@ pub struct FooterInfo {
     pub pi_time_ms: i64,
     /// Timestamp of the last app-provided sample, epoch ms.
     pub last_sample_ms: Option<i64>,
+    /// The phone's UTC offset in minutes, carried on every row it writes. Both
+    /// clocks below render through it, as every other dated surface does, so
+    /// the footer reads in the same zone as the panes above it.
+    pub tz_offset_min: i32,
     pub requests_per_hour: u32,
     /// Most recent alert summary for the ticker.
     pub alert_ticker: Option<String>,
@@ -81,9 +85,9 @@ fn render_wide(
         "RW {} \u{00b7} RO {} \u{00b7} Pi {} \u{00b7} smp {} \u{00b7} {}/h",
         info.rw_sessions,
         info.ro_sessions,
-        hms(info.pi_time_ms),
+        hms(info.pi_time_ms, info.tz_offset_min),
         info.last_sample_ms
-            .map(hms)
+            .map(|t| hms(t, info.tz_offset_min))
             .unwrap_or_else(|| "--:--:--".to_string()),
         info.requests_per_hour,
     );
@@ -136,9 +140,9 @@ fn render_mobile(
                 "RW {} RO {} \u{00b7} Pi {} \u{00b7} smp {} \u{00b7} {}/h",
                 info.rw_sessions,
                 info.ro_sessions,
-                hm(info.pi_time_ms),
+                hm(info.pi_time_ms, info.tz_offset_min),
                 info.last_sample_ms
-                    .map(hm)
+                    .map(|t| hm(t, info.tz_offset_min))
                     .unwrap_or_else(|| "--:--".to_string()),
                 info.requests_per_hour,
             ),
@@ -194,25 +198,52 @@ fn fmt_uptime(secs: u64) -> String {
     }
 }
 
-/// `HH:MM:SS` wall clock derived from epoch ms (24h wrap).
-fn hms(ms: i64) -> String {
+/// `HH:MM:SS` local wall clock for an epoch-ms instant at `tz_offset_min`
+/// (24h wrap). The offset is the phone's, so the footer's clocks read in the
+/// same zone as the dated surfaces above them.
+fn hms(ms: i64, tz_offset_min: i32) -> String {
     if ms <= 0 {
         return "--:--:--".to_string();
     }
-    let secs = ms / 1000;
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3_600) % 24;
+    let secs = (ms + tz_offset_min as i64 * 60_000).div_euclid(1000);
+    let s = secs.rem_euclid(60);
+    let m = secs.div_euclid(60).rem_euclid(60);
+    let h = secs.div_euclid(3_600).rem_euclid(24);
     format!("{h:02}:{m:02}:{s:02}")
 }
 
-/// `HH:MM` wall clock for the tight mobile row.
-fn hm(ms: i64) -> String {
+/// `HH:MM` local wall clock for the tight mobile row.
+fn hm(ms: i64, tz_offset_min: i32) -> String {
     if ms <= 0 {
         return "--:--".to_string();
     }
-    let secs = ms / 1000;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3_600) % 24;
+    let secs = (ms + tz_offset_min as i64 * 60_000).div_euclid(1000);
+    let m = secs.div_euclid(60).rem_euclid(60);
+    let h = secs.div_euclid(3_600).rem_euclid(24);
     format!("{h:02}:{m:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_clocks_render_in_the_phones_zone() {
+        // 2025-01-01T00:00:00Z at UTC−5 is 2024-12-31 19:00 local, which is
+        // what the Data pane and the phone itself both print for this row.
+        let ts = 1_735_689_600_000;
+        assert_eq!(hms(ts, -300), "19:00:00");
+        assert_eq!(hm(ts, -300), "19:00");
+        assert_eq!(hms(ts, 0), "00:00:00");
+        // A half-hour zone (UTC+5:45, Kathmandu) must not round away.
+        assert_eq!(hm(ts, 345), "05:45");
+        // Wrapping forward past midnight.
+        assert_eq!(hm(ts + 23 * 3_600_000, 120), "01:00");
+    }
+
+    #[test]
+    fn the_no_data_sentinel_survives_an_offset() {
+        assert_eq!(hms(0, -300), "--:--:--");
+        assert_eq!(hm(0, 600), "--:--");
+    }
 }

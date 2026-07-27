@@ -9,7 +9,7 @@ use anyhow::Context;
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
-use api::{Event, WsHub};
+use api::{Event, HubMsg, WsHub};
 use store::Store;
 use t1dm_core::Config;
 use tui::AppEvent;
@@ -50,7 +50,17 @@ fn main() -> anyhow::Result<()> {
     // TUI events so the TUI surface never depends on the api crate.
     let hub = WsHub::new(1024);
     let (tui_tx, tui_rx) = broadcast::channel::<AppEvent>(1024);
-    rt.spawn(bridge_events(hub.clone(), tui_tx));
+    // Subscribed here rather than inside the task so the hub's receiver count
+    // includes the bridge from this point on, never briefly under-reporting a
+    // client that attaches before the task is first polled.
+    let bridge_rx = hub.subscribe();
+    rt.spawn(bridge_events(bridge_rx, tui_tx));
+
+    // The bridge subscription above is the one permanent in-process receiver,
+    // so the hub always carries one more than the attached clients.
+    let hub_probe = hub.clone();
+    let clients: tui::ClientProbe =
+        std::sync::Arc::new(move || hub_probe.receiver_count().saturating_sub(1));
 
     // HTTP/WS server.
     let router = api::build_router(store.clone(), hub.clone());
@@ -72,7 +82,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     // The TUI runs on the main thread and owns the terminal for its lifetime.
-    let tui_result = tui::run(store, cfg, tui_rx);
+    let tui_result = tui::run(store, cfg, tui_rx, clients);
 
     rt.shutdown_background();
     tui_result.map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -99,9 +109,8 @@ fn load_config(path: &std::path::Path) -> Config {
     }
 }
 
-/// Subscribe to the WS hub and forward each event to the TUI channel.
-async fn bridge_events(hub: WsHub, tui_tx: broadcast::Sender<AppEvent>) {
-    let mut rx = hub.subscribe();
+/// Forward each hub event to the TUI channel.
+async fn bridge_events(mut rx: broadcast::Receiver<HubMsg>, tui_tx: broadcast::Sender<AppEvent>) {
     loop {
         match rx.recv().await {
             Ok(msg) => {
@@ -111,9 +120,12 @@ async fn bridge_events(hub: WsHub, tui_tx: broadcast::Sender<AppEvent>) {
                     Event::Note(n) => AppEvent::Note(n),
                     Event::Photo(p) => AppEvent::Photo(p),
                     Event::Alert(a) => AppEvent::Alert(a),
-                    // Meal/Dose/BasalSchedule/Stats carry no footer indicator; the dashboard
-                    // reconstructs them from the store on its tick refresh.
-                    Event::Meal(_) | Event::Dose(_) | Event::BasalSchedule(_) | Event::Stats(_) => continue,
+                    // Meal/Dose/BasalSchedule/Stats carry no footer indicator, but the
+                    // panes reconstruct them from the store behind a throttle — and a
+                    // non-animating layout draws no frame unless something asks for one.
+                    Event::Meal(_) | Event::Dose(_) | Event::BasalSchedule(_) | Event::Stats(_) => {
+                        AppEvent::StoreChanged
+                    }
                 };
                 let _ = tui_tx.send(ev);
             }

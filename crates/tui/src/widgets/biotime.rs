@@ -1,10 +1,10 @@
 //! Circadian bio-time gauge, rendered as ANALOG CLOCK dials on a braille
-//! canvas. The model's 12-bin (2h) time-of-day distribution is reduced to its
-//! peak bin and shown as a "BIO" clock whose hour hand points at the predicted
-//! circadian phase; the prediction confidence is drawn both as a percentage
-//! label and as a bright arc sweeping clockwise from 12 around the dial. When
-//! the area affords it a second "NOW" dial shows the current local wall-clock
-//! time with real minute precision, the two labels centred as a pair above.
+//! canvas. The "BIO" clock reads the model's own circadian phase — the
+//! continuous probability-weighted mean-resultant hour the phone ships as
+//! `predicted_hour`, shown to the minute; the prediction confidence is drawn
+//! both as a percentage label and as a bright arc sweeping clockwise from 12
+//! around the dial. When the area affords it a second "NOW" dial shows the
+//! current local wall-clock time, the two labels centred as a pair above.
 
 use std::f64::consts::PI;
 
@@ -23,6 +23,8 @@ pub struct BioTimeGauge {
     current_bin: usize,
     /// Real local wall-clock time for the NOW dial, if supplied.
     now_local: Option<(u8, u8)>,
+    /// The model's circadian hour in `[0, 24)`, as the phone computed it.
+    bio_hour: Option<f64>,
 }
 
 impl BioTimeGauge {
@@ -46,14 +48,23 @@ impl BioTimeGauge {
         self
     }
 
-    /// The actual local wall-clock time, driving the NOW dial's hands with real
-    /// minute precision (the BIO dial keeps its coarse 2h resolution).
+    /// The actual local wall-clock time, driving the NOW dial's hands.
     pub fn now_local(mut self, hour: u8, minute: u8) -> Self {
         self.now_local = Some((hour % 24, minute % 60));
         self
     }
 
-    /// Argmax of the time-of-day distribution -> predicted 2h bin.
+    /// The model's circadian hour, verbatim from the wire's `predicted_hour`.
+    /// That value is the probability-weighted MEAN RESULTANT over the hour
+    /// circle, not the argmax bin: a belief split evenly over six 2h bins
+    /// resolves to 06:00, where an argmax would arbitrarily keep the first bin.
+    pub fn bio_hour(mut self, h: f64) -> Self {
+        self.bio_hour = Some(h.rem_euclid(24.0));
+        self
+    }
+
+    /// Argmax of the time-of-day distribution -> predicted 2h bin. Only the
+    /// fallback for a prediction that carries no circadian belief at all.
     fn peak_bin(&self) -> usize {
         let mut best = 0usize;
         let mut best_v = f64::NEG_INFINITY;
@@ -66,15 +77,26 @@ impl BioTimeGauge {
         best % TOD_BINS.max(1)
     }
 
+    /// The BIO dial's `(hour, minute)`. The phone's `predicted_hour` when the
+    /// wire carried a circadian belief; otherwise the centre of the argmax 2h
+    /// bin, which is all a bare probability vector can support.
+    fn bio_hm(&self) -> (usize, usize) {
+        let h = self
+            .bio_hour
+            .unwrap_or_else(|| (self.peak_bin() * 2 + 1) as f64);
+        (
+            h.floor() as usize % 24,
+            ((h.fract() * 60.0).round() as usize).min(59),
+        )
+    }
+
     pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &dyn Theme) {
         if area.width < 4 || area.height == 0 {
             return;
         }
         let pal = theme.palette();
 
-        let bio_bin = self.peak_bin();
-        // Centre of the 2h bin, in hours (1, 3, 5, ... 23).
-        let bio_hour = (bio_bin * 2 + 1) % 24;
+        let (bio_hour, bio_min) = self.bio_hm();
         // Prefer the real local time; fall back to the 2h bin's centre hour.
         let (now_hour, now_min) = match self.now_local {
             Some((h, m)) => (h as usize % 24, Some(m)),
@@ -85,7 +107,7 @@ impl BioTimeGauge {
         // A dial needs the header row plus at least one cell-row beneath it.
         if area.height < 2 {
             let head = truncate(
-                &format!("BIO {bio_hour:02}:00  conf {pct}%"),
+                &format!("BIO {bio_hour:02}:{bio_min:02}  conf {pct}%"),
                 area.width as usize,
             );
             buf.set_string(
@@ -142,14 +164,14 @@ impl BioTimeGauge {
 
             // The two labels form one centred group over the pair of dials,
             // rather than each label perching over its own dial.
-            let bio_label = format!("BIO {bio_hour:02}:00  conf {pct}%");
+            let bio_label = format!("BIO {bio_hour:02}:{bio_min:02}  conf {pct}%");
             let now_label = format!("NOW {now_hour:02}:{now_hm:02}");
             self.draw_header(buf, area, pal, &bio_label, &now_label);
 
             self.draw_dial(
                 buf,
                 Rect::new(bio_x, dial_y, w_cells, h_cells),
-                (bio_hour, None),
+                (bio_hour, Some(bio_min as u8)),
                 self.conf,
                 &bio_colors,
                 pal,
@@ -164,13 +186,13 @@ impl BioTimeGauge {
             );
         } else {
             let x0 = area.x + (area.width.saturating_sub(w_cells)) / 2;
-            let bio_label = format!("BIO {bio_hour:02}:00  conf {pct}%");
+            let bio_label = format!("BIO {bio_hour:02}:{bio_min:02}  conf {pct}%");
             let now_label = format!("NOW {now_hour:02}:{now_hm:02}");
             self.draw_header(buf, area, pal, &bio_label, &now_label);
             self.draw_dial(
                 buf,
                 Rect::new(x0, dial_y, w_cells, h_cells),
-                (bio_hour, None),
+                (bio_hour, Some(bio_min as u8)),
                 self.conf,
                 &bio_colors,
                 pal,
@@ -210,8 +232,8 @@ impl BioTimeGauge {
 
     /// Raster one analog dial into `rect`: dim rim + a bright confidence arc
     /// (clockwise from 12, length ∝ `conf`), 12 hour ticks, an hour hand at
-    /// `hour` (advanced fractionally when a minute is given), a minute hand at
-    /// `minute` (pinned to 12 when `None`), and a centre hub.
+    /// `hour` (advanced fractionally by the minute), a minute hand at `minute`
+    /// (pinned to 12 when `None`), and a centre hub.
     fn draw_dial(
         &self,
         buf: &mut Buffer,
@@ -265,7 +287,7 @@ impl BioTimeGauge {
 
         // Hands. When a minute is supplied the hour hand advances fractionally
         // and the minute hand points at the real minute; otherwise the minute
-        // hand is pinned to 12 (a 2h bin has no sub-hour phase to show).
+        // hand is pinned to 12.
         let frac = minute.map(|m| m as f64 / 60.0).unwrap_or(0.0);
         let hour_a = (((hour % 12) as f64 + frac) / 12.0) * 2.0 * PI;
         let minute_a = frac * 2.0 * PI;
@@ -400,5 +422,43 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(max).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dial_reads_the_phones_resultant_hour_not_the_argmax_bin() {
+        // Six 2h bins at 1/6 each: the mean resultant over the hour circle is
+        // 06:00 (the phone's `predicted_hour`), while an argmax keeps the first
+        // maximum and would point the hand at 01:00.
+        let mut probs = vec![0.0; TOD_BINS];
+        for p in probs.iter_mut().take(6) {
+            *p = 1.0 / 6.0;
+        }
+        let g = BioTimeGauge::new().tod(probs.clone()).bio_hour(6.0);
+        assert_eq!(g.bio_hm(), (6, 0));
+        assert_eq!(BioTimeGauge::new().tod(probs).peak_bin(), 0);
+    }
+
+    #[test]
+    fn a_fractional_hour_lands_between_bin_centres() {
+        // bin3 = bin4 = 0.5 resolves to 08:00 on the phone; the 2h bin centres
+        // it sits between are 07:00 and 09:00.
+        assert_eq!(BioTimeGauge::new().bio_hour(8.0).bio_hm(), (8, 0));
+        assert_eq!(BioTimeGauge::new().bio_hour(13.75).bio_hm(), (13, 45));
+        assert_eq!(BioTimeGauge::new().bio_hour(23.999).bio_hm(), (23, 59));
+        // The wire hour is taken modulo the day, never clamped.
+        assert_eq!(BioTimeGauge::new().bio_hour(-0.5).bio_hm(), (23, 30));
+        assert_eq!(BioTimeGauge::new().bio_hour(24.25).bio_hm(), (0, 15));
+    }
+
+    #[test]
+    fn without_a_circadian_belief_it_falls_back_to_the_bin_centre() {
+        let mut probs = vec![0.0; TOD_BINS];
+        probs[9] = 1.0;
+        assert_eq!(BioTimeGauge::new().tod(probs).bio_hm(), (19, 0));
     }
 }

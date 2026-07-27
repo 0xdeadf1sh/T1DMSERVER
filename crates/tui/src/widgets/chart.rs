@@ -42,6 +42,9 @@ pub(crate) struct Proj {
     pub t_right: i64,
     pub y_min: f64,
     pub y_max: f64,
+    /// Display unit the value axis is warped by. Bounds and data are mg/dL;
+    /// only bands carrying glucose set this. Strips leave it at `Mgdl`.
+    pub unit: BgUnit,
 }
 
 impl Proj {
@@ -55,10 +58,17 @@ impl Proj {
         (0.0..=1.0).contains(&f).then_some(f)
     }
 
-    /// Fraction 0..=1 up the value axis (clamped).
+    /// Fraction 0..=1 up the value axis (clamped). The value *and* both bounds
+    /// pass through the display transform, so the axis is linear in the unit it
+    /// is labelled in — the phone maps every reading through `kovatchevF`
+    /// before its own y-projection, and placing data linearly in mg/dL under a
+    /// risk-labelled axis would flatten a hypo dip by ~1.4×. Affine for
+    /// mg/dL and mmol/L, so only the Kovatchev axis moves.
     fn y_frac(&self, v: f64) -> f64 {
-        let span = (self.y_max - self.y_min).max(1e-6);
-        ((v - self.y_min) / span).clamp(0.0, 1.0)
+        let lo = self.unit.from_mgdl(self.y_min);
+        let hi = self.unit.from_mgdl(self.y_max);
+        let span = (hi - lo).max(1e-6);
+        ((self.unit.from_mgdl(v) - lo) / span).clamp(0.0, 1.0)
     }
 
     /// Cell column within `plot` for `ts`, or `None` if outside the window.
@@ -298,6 +308,7 @@ impl BgChart {
             t_right: self.t_right,
             y_min: self.y_min,
             y_max: self.y_max,
+            unit: self.unit,
         }
     }
 
@@ -628,6 +639,63 @@ impl BgChart {
         let ly = y0 + hh;
         if ly < plot.bottom() {
             crate::boot::put_str(buf, plot, lx, ly, &label, color, pal.bg);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proj(unit: BgUnit) -> Proj {
+        Proj {
+            t_left: 0,
+            t_right: 1,
+            y_min: 40.0,
+            y_max: 250.0,
+            unit,
+        }
+    }
+
+    #[test]
+    fn value_axis_is_linear_in_the_unit_it_is_labelled_in() {
+        // An axis of 40..250 mg/dL. In mg/dL the placement is the raw linear
+        // fraction; in risk space it is linear in f(g), the axis the phone
+        // projects onto (GraphFrame maps every reading through kovatchevF
+        // before its own y-projection).
+        let mgdl = proj(BgUnit::Mgdl);
+        assert!((mgdl.y_frac(54.0) - 0.066_667).abs() < 1e-4);
+        assert!((mgdl.y_frac(112.5) - 0.345_238).abs() < 1e-4);
+        assert!((mgdl.y_frac(180.0) - 0.666_667).abs() < 1e-4);
+
+        let kov = proj(BgUnit::Kovachev);
+        assert!((kov.y_frac(54.0) - 0.161_6).abs() < 1e-3);
+        assert!((kov.y_frac(112.5) - 0.560_2).abs() < 1e-3);
+        assert!((kov.y_frac(180.0) - 0.818_0).abs() < 1e-3);
+
+        // mmol/L is an affine rescale of mg/dL, so it must not move at all.
+        let mmol = proj(BgUnit::Mmol);
+        for &v in &[54.0, 112.5, 180.0] {
+            assert!((mmol.y_frac(v) - mgdl.y_frac(v)).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn risk_axis_deepens_a_hypo_dip_relative_to_mgdl() {
+        // The whole point of the transform: below-range excursions occupy more
+        // of the plot than a linear mg/dL axis gives them.
+        let mgdl = proj(BgUnit::Mgdl);
+        let kov = proj(BgUnit::Kovachev);
+        assert!(kov.y_frac(54.0) > mgdl.y_frac(54.0) * 2.0);
+        assert!(kov.y_frac(70.0) > mgdl.y_frac(70.0));
+    }
+
+    #[test]
+    fn axis_bounds_pin_the_ends_in_every_unit() {
+        for unit in [BgUnit::Mgdl, BgUnit::Mmol, BgUnit::Kovachev] {
+            let p = proj(unit);
+            assert!(p.y_frac(40.0).abs() < 1e-9);
+            assert!((p.y_frac(250.0) - 1.0).abs() < 1e-9);
         }
     }
 }

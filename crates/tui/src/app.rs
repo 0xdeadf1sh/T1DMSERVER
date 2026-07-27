@@ -21,7 +21,7 @@ use crate::layout::{AppLayout, LayoutMode};
 use crate::panes::{make_pane, Action, Ctx, Pane, PaneView};
 use crate::theme::{theme_for, Theme, ThemeKind};
 use crate::widgets::panel::{self, Section};
-use crate::AppEvent;
+use crate::{AppEvent, ClientProbe};
 
 /// Minimum wall-clock gap between heavy footer refreshes (sysinfo + store).
 /// The cheap clock field is refreshed on every drawn frame; the costly system
@@ -34,6 +34,25 @@ const FOOTER_REFRESH: Duration = Duration::from_millis(1000);
 /// heavy for a per-frame call; the panels tolerate stale figures for a few
 /// seconds, so the cached block is refreshed on this cadence instead.
 const STATS_REFRESH: Duration = Duration::from_millis(4000);
+
+/// How recently a session must have been seen to count as live. Session rows
+/// are never deleted — each `(token, ip, device)` triple persists across
+/// reconnects and DHCP leases — so a row's own liveness can only be read off
+/// `last_seen`. The phone touches its session on every authenticated request
+/// and pushes on the 5-minute sample grid; two missed cycles is the tightest
+/// window that cannot flap between two healthy pushes. A client whose only
+/// traffic is the open stream never bumps `last_seen` at all, so it is counted
+/// through [`App::clients`] instead.
+const SESSION_LIVE_MS: i64 = 10 * 60 * 1000;
+
+/// Minimum wall-clock gap between store-event cache invalidations. Bulk writes
+/// broadcast one hub event per stored row, so a re-mirror arrives as thousands
+/// of back-to-back wake-ups; invalidating on each would clear the panes' fetch
+/// caches faster than their own throttles can refill them, defeating those
+/// throttles during exactly the burst they exist for. The debounce keeps a
+/// leading edge — an isolated meal or note still repaints on the next frame —
+/// and folds the remainder of a burst into one trailing refetch.
+const INVALIDATE_COALESCE: Duration = Duration::from_millis(250);
 
 pub struct App {
     store: Store,
@@ -67,10 +86,17 @@ pub struct App {
     stats_cache: Option<[Stats; 3]>,
     /// When the panel statistics were last recomputed.
     last_stats_refresh: Option<Instant>,
+    /// Number of clients attached to the WS stream, probed from the server.
+    clients: ClientProbe,
+    /// A store event arrived inside the [`INVALIDATE_COALESCE`] window and its
+    /// invalidation is still owed.
+    pending_invalidate: bool,
+    /// When the pane caches were last invalidated.
+    last_invalidate: Option<Instant>,
 }
 
 impl App {
-    pub fn new(store: Store, cfg: Config) -> Self {
+    pub fn new(store: Store, cfg: Config, clients: ClientProbe) -> Self {
         let theme_kind = ThemeKind::from_str_or_default(&cfg.ui.theme);
         let theme = theme_for(theme_kind);
         let unit = cfg.ui.bg_unit;
@@ -104,6 +130,9 @@ impl App {
             panel_scroll: 0,
             stats_cache: None,
             last_stats_refresh: None,
+            clients,
+            pending_invalidate: false,
+            last_invalidate: None,
         }
     }
 
@@ -115,11 +144,6 @@ impl App {
     /// Mutable access to the footer telemetry the loop refreshes each frame.
     pub fn footer_mut(&mut self) -> &mut FooterInfo {
         &mut self.footer
-    }
-
-    /// Update connection state (driven by the WS client count).
-    pub fn set_connected(&mut self, connected: bool) {
-        self.connected = connected;
     }
 
     fn now_ms(&self) -> i64 {
@@ -320,6 +344,9 @@ impl App {
 
     /// Advance the visible pane's animation; returns true if still animating.
     pub fn tick(&mut self, dt: Duration) -> bool {
+        // Before the visible pane is taken out of the map, so a settling
+        // invalidation reaches it too.
+        let settling = self.settle_invalidation();
         let pane_id = self.current;
         let mut pane = self
             .panes
@@ -342,20 +369,76 @@ impl App {
         // is on screen (Full layout), so it keeps the demand-driven loop serving
         // frames (the fps cap still governs the rate); otherwise only a live pane
         // animation does.
-        let animating =
-            ctx.dirty || (matches!(self.mode(), LayoutMode::Full) && self.theme.has_animation());
+        let animating = ctx.dirty
+            || settling
+            || (matches!(self.mode(), LayoutMode::Full) && self.theme.has_animation());
         self.panes.insert(pane_id, pane);
         animating
     }
 
-    /// Apply a data event pushed from the server side.
+    /// Apply a data event pushed from the server side. Every kind that mutates
+    /// a record a pane serves out of a throttled cache — samples, predictions,
+    /// notes, photos, and the aggregate [`AppEvent::StoreChanged`] — drops that
+    /// cache. Alerts are the exception: they reach the footer directly and no
+    /// pane reads them back from the store.
     pub fn apply_event(&mut self, ev: AppEvent) {
         self.connected = true;
         match ev {
-            AppEvent::Sample(row) => self.footer.last_sample_ms = Some(row.ts),
             AppEvent::Alert(a) => self.footer.alert_ticker = Some(a.kind),
-            AppEvent::Prediction(_) | AppEvent::Note(_) | AppEvent::Photo(_) => {}
+            AppEvent::Sample(row) => {
+                self.footer.last_sample_ms = Some(row.ts);
+                // The phone stamps its live offset on every row precisely so
+                // the appliance can render local time; the footer clocks track
+                // the most recent one and keep the previous until then.
+                self.footer.tz_offset_min = row.tz_offset;
+                self.note_store_change();
+            }
+            AppEvent::Prediction(_)
+            | AppEvent::Note(_)
+            | AppEvent::Photo(_)
+            | AppEvent::StoreChanged => self.note_store_change(),
         }
+    }
+
+    /// Record a store write, invalidating the cached reads at most once per
+    /// [`INVALIDATE_COALESCE`]. An event inside the window only marks the
+    /// invalidation as owed; [`App::settle_invalidation`] pays it on the first
+    /// frame after the window closes.
+    fn note_store_change(&mut self) {
+        if self.invalidate_due() {
+            self.invalidate_caches();
+        } else {
+            self.pending_invalidate = true;
+        }
+    }
+
+    fn invalidate_due(&self) -> bool {
+        self.last_invalidate
+            .is_none_or(|t| t.elapsed() >= INVALIDATE_COALESCE)
+    }
+
+    /// Drop the app-level and per-pane fetch caches so the next frame re-reads.
+    fn invalidate_caches(&mut self) {
+        self.last_invalidate = Some(Instant::now());
+        self.pending_invalidate = false;
+        self.last_stats_refresh = None;
+        for pane in self.panes.values_mut() {
+            pane.invalidate();
+        }
+    }
+
+    /// Pay an owed invalidation once its coalescing window has closed. Returns
+    /// true while one is still outstanding, which keeps the demand-driven loop
+    /// serving frames long enough for the trailing refetch to land.
+    fn settle_invalidation(&mut self) -> bool {
+        if !self.pending_invalidate {
+            return false;
+        }
+        if !self.invalidate_due() {
+            return true;
+        }
+        self.invalidate_caches();
+        false
     }
 
     /// Refresh footer telemetry. The wall clock is updated every frame; the
@@ -390,25 +473,35 @@ impl App {
             self.cfg.qr.advertise_addr, self.cfg.qr.advertise_port
         );
 
-        let (rw, ro) = self.session_counts();
+        let (rw, ro) = self.session_counts(now_ms);
+        // A read-only viewer may send nothing but the stream it holds open, and
+        // nothing on that socket touches `last_seen` after the upgrade, so the
+        // session sweep cannot see it at all. Credit every attached stream the
+        // sweep did not account for to the read-only tally — a writer pushes on
+        // the 5-minute grid and always refreshes its own row — otherwise the
+        // footer contradicts itself, reading "connected" beside "RO 0".
+        let attached = (self.clients)() as u32;
+        let ro = ro + attached.saturating_sub(rw + ro);
         self.footer.rw_sessions = rw;
         self.footer.ro_sessions = ro;
-        // A live session implies at least one connected client.
-        if rw + ro > 0 {
-            self.connected = true;
-        }
+        self.connected = rw + ro > 0;
     }
 
-    /// Count persisted sessions by the access class of their token. This is the
-    /// best proxy the TUI has for "connected RW/RO" without the WS hub.
-    fn session_counts(&self) -> (u32, u32) {
+    /// Count sessions seen within [`SESSION_LIVE_MS`] by the access class of
+    /// their token. Only live tokens are mapped, so a session left behind by a
+    /// revoked token stops being tallied — matching the WS liveness sweep,
+    /// which drops such a stream within its own cut-off.
+    fn session_counts(&self, now_ms: i64) -> (u32, u32) {
         let mut kind_by_id: HashMap<i64, TokenKind> = HashMap::new();
-        for t in self.store.list_tokens(true).unwrap_or_default() {
+        for t in self.store.list_tokens(false).unwrap_or_default() {
             kind_by_id.insert(t.id, t.kind);
         }
         let mut rw = 0u32;
         let mut ro = 0u32;
         for s in self.store.list_sessions().unwrap_or_default() {
+            if now_ms.saturating_sub(s.last_seen) >= SESSION_LIVE_MS {
+                continue;
+            }
             match kind_by_id.get(&s.token_id) {
                 Some(TokenKind::Rw) => rw += 1,
                 Some(TokenKind::Ro) => ro += 1,
@@ -536,4 +629,216 @@ fn storage_for(data_dir: &str) -> (f32, f32) {
 
     const GB: f32 = 1024.0 * 1024.0 * 1024.0;
     (total.saturating_sub(avail) as f32 / GB, total as f32 / GB)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use t1dm_core::{Alert, Note, Photo, PredictionEvent, SampleRow};
+
+    /// A store rooted in a fresh temp dir, wiped on drop.
+    struct TempStore {
+        store: Store,
+        dir: PathBuf,
+    }
+
+    impl TempStore {
+        fn new() -> TempStore {
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("t1dm-tui-test-{}-{}", std::process::id(), n));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Store::open_at(&dir).expect("open store");
+            TempStore { store, dir }
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// An app over a throwaway store, with the client probe pinned to
+    /// `clients`. The store outlives the app, so the tuple must be held whole.
+    fn test_app(clients: usize) -> (App, TempStore) {
+        let ts = TempStore::new();
+        let probe: ClientProbe = Arc::new(move || clients);
+        let app = App::new(ts.store.clone(), Config::default(), probe);
+        (app, ts)
+    }
+
+    /// Apply one event against a clean slate and report whether it dropped the
+    /// cached reads.
+    fn invalidates(app: &mut App, ev: AppEvent) -> bool {
+        app.last_invalidate = None;
+        app.pending_invalidate = false;
+        app.last_stats_refresh = Some(Instant::now());
+        app.apply_event(ev);
+        app.last_stats_refresh.is_none()
+    }
+
+    #[test]
+    fn store_events_coalesce_into_one_invalidation() {
+        let (mut app, _ts) = test_app(0);
+        // A pane that neither animates nor requests redraws, in a layout with
+        // no gutter animation, so `tick` reports only the pending invalidation.
+        app.current = Pane::Notes;
+        app.last_area = Rect::new(0, 0, 80, 24);
+
+        // Leading edge: the first write of a burst repaints at once.
+        app.last_stats_refresh = Some(Instant::now());
+        app.apply_event(AppEvent::StoreChanged);
+        assert!(app.last_stats_refresh.is_none());
+        assert!(!app.pending_invalidate);
+
+        // A bulk re-mirror broadcasts one event per row; the cache must survive
+        // all of them and be dropped once, afterwards.
+        app.last_stats_refresh = Some(Instant::now());
+        for _ in 0..2000 {
+            app.apply_event(AppEvent::StoreChanged);
+        }
+        assert!(
+            app.last_stats_refresh.is_some(),
+            "burst re-invalidated per event"
+        );
+        assert!(app.pending_invalidate);
+        assert!(
+            app.tick(Duration::from_millis(16)),
+            "loop must stay awake for the trailing refetch"
+        );
+        assert!(app.last_stats_refresh.is_some());
+
+        std::thread::sleep(INVALIDATE_COALESCE);
+        assert!(!app.tick(Duration::from_millis(16)));
+        assert!(app.last_stats_refresh.is_none());
+        assert!(!app.pending_invalidate);
+        assert!(!app.tick(Duration::from_millis(16)));
+    }
+
+    #[test]
+    fn every_cached_event_kind_drops_the_caches() {
+        let (mut app, _ts) = test_app(0);
+
+        assert!(invalidates(&mut app, AppEvent::Sample(SampleRow::default())));
+        assert!(invalidates(
+            &mut app,
+            AppEvent::Prediction(PredictionEvent::default())
+        ));
+        assert!(invalidates(&mut app, AppEvent::Note(Note::default())));
+        assert!(invalidates(&mut app, AppEvent::Photo(Photo::default())));
+        assert!(invalidates(&mut app, AppEvent::StoreChanged));
+        // Alerts reach the footer directly; no pane reads them back.
+        assert!(!invalidates(&mut app, AppEvent::Alert(Alert::default())));
+
+        // The footer indicators the typed variants carry still land.
+        app.apply_event(AppEvent::Sample(SampleRow {
+            ts: 1_700_000_000_000,
+            ..Default::default()
+        }));
+        assert_eq!(app.footer.last_sample_ms, Some(1_700_000_000_000));
+        app.apply_event(AppEvent::Alert(Alert {
+            kind: "hypo".to_string(),
+            ..Default::default()
+        }));
+        assert_eq!(app.footer.alert_ticker.as_deref(), Some("hypo"));
+    }
+
+    #[test]
+    fn revoked_tokens_drop_out_of_the_session_counts() {
+        let (app, ts) = test_app(0);
+        let now = app.now_ms();
+
+        let (ro, _) = ts.store.mint_token(TokenKind::Ro, None).unwrap();
+        ts.store
+            .upsert_session(ro.id, "10.0.0.9", "viewer", "laptop")
+            .unwrap();
+        let (old_rw, _) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+        ts.store
+            .upsert_session(old_rw.id, "10.0.0.2", "phone", "phone")
+            .unwrap();
+        // Minting a second RW revokes the first (`one_rw`); the stale session
+        // row survives and must stop being tallied.
+        let (new_rw, _) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+        ts.store
+            .upsert_session(new_rw.id, "10.0.0.3", "phone", "phone")
+            .unwrap();
+        assert_eq!(app.session_counts(now), (1, 1));
+
+        ts.store.revoke_token(ro.id).unwrap();
+        assert_eq!(app.session_counts(now), (1, 0));
+    }
+
+    #[test]
+    fn an_open_stream_reads_as_connected() {
+        let (mut app, _ts) = test_app(1);
+        let now = app.now_ms();
+        app.refresh_footer(now);
+        // The counts and the indicator must never contradict each other: a
+        // stream-only viewer bumps no `last_seen`, so the sweep misses it and
+        // the attached-client probe is the only evidence it is alive.
+        assert_eq!(
+            (app.footer.rw_sessions, app.footer.ro_sessions),
+            (0, 1),
+            "a client whose only traffic is the stream never bumps last_seen"
+        );
+        assert!(app.connected);
+
+        let (mut idle, _ts2) = test_app(0);
+        let now = idle.now_ms();
+        idle.refresh_footer(now);
+        assert_eq!((idle.footer.rw_sessions, idle.footer.ro_sessions), (0, 0));
+        assert!(!idle.connected);
+    }
+
+    #[test]
+    fn a_streaming_writer_is_not_counted_twice() {
+        // The phone holds a stream open AND touches its session on every push,
+        // so the one attached client is already in the RW tally.
+        let (mut app, ts) = test_app(1);
+        let (rw, _) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
+        ts.store
+            .upsert_session(rw.id, "10.0.0.2", "phone", "phone")
+            .unwrap();
+        let now = app.now_ms();
+        app.refresh_footer(now);
+        assert_eq!((app.footer.rw_sessions, app.footer.ro_sessions), (1, 0));
+
+        // A second stream beside it is a viewer the sweep cannot see.
+        let (mut two, ts2) = test_app(2);
+        let (rw2, _) = ts2.store.mint_token(TokenKind::Rw, None).unwrap();
+        ts2.store
+            .upsert_session(rw2.id, "10.0.0.2", "phone", "phone")
+            .unwrap();
+        let now = two.now_ms();
+        two.refresh_footer(now);
+        assert_eq!((two.footer.rw_sessions, two.footer.ro_sessions), (1, 1));
+    }
+
+    #[test]
+    fn the_footer_clocks_follow_the_phones_offset() {
+        let (mut app, _ts) = test_app(0);
+        assert_eq!(app.footer.tz_offset_min, 0);
+        app.apply_event(AppEvent::Sample(SampleRow {
+            ts: 1_735_689_600_000,
+            tz_offset: -300,
+            ..Default::default()
+        }));
+        assert_eq!(app.footer.tz_offset_min, -300);
+        // A later row in a new zone moves the clocks with it.
+        app.apply_event(AppEvent::Sample(SampleRow {
+            ts: 1_735_693_200_000,
+            tz_offset: 345,
+            ..Default::default()
+        }));
+        assert_eq!(app.footer.tz_offset_min, 345);
+        // An event carrying no offset leaves the last one standing.
+        app.apply_event(AppEvent::StoreChanged);
+        assert_eq!(app.footer.tz_offset_min, 345);
+    }
 }

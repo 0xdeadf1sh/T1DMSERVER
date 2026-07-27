@@ -124,6 +124,10 @@ impl PaneView for NotesPane {
             Action::None
         }
     }
+
+    fn invalidate(&mut self) {
+        self.last_fetch = None;
+    }
 }
 
 /// Format an epoch-ms instant, applying a tz offset in minutes east of UTC, as

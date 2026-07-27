@@ -13,7 +13,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
-use t1dm_core::QUANTILE_LEVELS;
+use t1dm_core::{BgUnit, QUANTILE_LEVELS};
 
 use crate::theme::Theme;
 use crate::widgets::chart::{plot_area, Proj};
@@ -28,6 +28,7 @@ pub struct FanWidget {
     t_right: i64,
     y_min: f64,
     y_max: f64,
+    unit: BgUnit,
     points: Vec<FanColumn>,
 }
 
@@ -48,6 +49,14 @@ impl FanWidget {
         self
     }
 
+    /// The display unit whose axis the quantiles are projected onto. Must match
+    /// the chart it shades, or the fan and the median line it wraps land on two
+    /// different value axes.
+    pub fn unit(mut self, unit: BgUnit) -> Self {
+        self.unit = unit;
+        self
+    }
+
     /// Fan columns, sorted ascending by timestamp.
     pub fn points(mut self, mut points: Vec<FanColumn>) -> Self {
         points.sort_by_key(|&(ts, _)| ts);
@@ -61,6 +70,7 @@ impl FanWidget {
             t_right: self.t_right,
             y_min: self.y_min,
             y_max: self.y_max,
+            unit: self.unit,
         }
     }
 

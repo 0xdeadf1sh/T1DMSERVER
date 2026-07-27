@@ -173,6 +173,11 @@ pub trait PaneView {
 
     /// Advance any live animation by `dt`. Only called for the visible pane.
     fn tick(&mut self, _dt: Duration, _ctx: &mut Ctx) {}
+
+    /// Drop any throttled store-fetch cache so the next render re-reads. Called
+    /// when the server signals a write the pane's own refresh interval would
+    /// otherwise hide for seconds.
+    fn invalidate(&mut self) {}
 }
 
 /// Construct the boxed pane implementation for a [`Pane`].

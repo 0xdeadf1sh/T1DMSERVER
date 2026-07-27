@@ -138,6 +138,14 @@ pub struct DashboardPane {
     hr_bpm: Option<f64>,
     /// Throttled store-fetch cache; see [`FETCH_REFRESH`].
     cache: Option<FetchCache>,
+    /// The phone's timezone offset, latched from the newest sample ever seen.
+    /// A window holding no samples carries no offset of its own, and 0 is a
+    /// real UTC offset rather than a sentinel — without this the whole pane
+    /// would silently jump zones on a pan into a gap.
+    last_tz: Option<i32>,
+    /// The cold-start lookback for [`DashboardPane::last_tz`] has been tried.
+    /// A store with no samples at all must not repeat it every fetch.
+    tz_seeded: bool,
 }
 
 impl Default for DashboardPane {
@@ -153,6 +161,8 @@ impl Default for DashboardPane {
             heart_phase: 0.0,
             hr_bpm: None,
             cache: None,
+            last_tz: None,
+            tz_seeded: false,
         }
     }
 }
@@ -173,7 +183,7 @@ impl DashboardPane {
     /// Pull every store-backed series the dashboard renders for the window
     /// `[t_left, t_right]` in one shot. Heavy (five queries plus curve
     /// reconstruction), so it is called only when [`FetchCache`] is stale.
-    fn fetch(&self, ctx: &Ctx, t_left: i64, t_right: i64, n_pts: usize) -> FetchCache {
+    fn fetch(&mut self, ctx: &Ctx, t_left: i64, t_right: i64, n_pts: usize) -> FetchCache {
         let samples = ctx
             .store
             .get_samples(&Series::ALL, Some(t_left), Some(t_right), Some(n_pts), None)
@@ -188,7 +198,20 @@ impl DashboardPane {
             .collect();
         // Latest in-view heart rate drives the beating-heart indicator.
         let hr_bpm = hr_pts.last().map(|&(_, v)| v).filter(|v| *v > 0.0);
-        let tz = samples.last().map(|r| r.tz_offset).unwrap_or(0);
+        // The phone stamps its live offset on every row, so a populated window
+        // latches it for the empty ones that follow: panning into a gap must
+        // not silently re-render the axis, the title clock and the NOW dial in
+        // UTC, which is indistinguishable from a genuine UTC user.
+        let tz = match samples.last() {
+            Some(r) => {
+                self.last_tz = Some(r.tz_offset);
+                r.tz_offset
+            }
+            None => match self.last_tz {
+                Some(tz) => tz,
+                None => self.seed_tz(ctx, t_right).unwrap_or(0),
+            },
+        };
         // Insulin and carb strips are reconstructed from the stored
         // meal/dose/basal events — each row resolved from its verbatim
         // custom_curve when present, else the ported gamma/Bateman params —
@@ -224,6 +247,34 @@ impl DashboardPane {
             notes,
             photos,
         }
+    }
+
+    /// Cold-start backstop for [`DashboardPane::last_tz`]: the offset stamped
+    /// on the newest sample in the week before `t_right`. A first render onto
+    /// an empty window — a fresh process panned into a gap, or one opened
+    /// before the first sync — has nothing to latch from, and UTC is not a
+    /// safe stand-in for "unknown". Runs at most once per pane.
+    fn seed_tz(&mut self, ctx: &Ctx, t_right: i64) -> Option<i32> {
+        if self.tz_seeded {
+            return None;
+        }
+        self.tz_seeded = true;
+        const LOOKBACK_MS: i64 = 7 * 24 * 3_600_000;
+        // `get_samples` orders ascending and truncates from the oldest end, so
+        // the bound is what puts the newest row within reach, not the limit.
+        self.last_tz = ctx
+            .store
+            .get_samples(
+                &Series::ALL,
+                Some(t_right - LOOKBACK_MS),
+                Some(t_right),
+                Some(4096),
+                None,
+            )
+            .unwrap_or_default()
+            .last()
+            .map(|r| r.tz_offset);
+        self.last_tz
     }
 
     fn draw_title(
@@ -300,7 +351,8 @@ impl PaneView for DashboardPane {
             .as_ref()
             .is_none_or(|c| c.key != key || c.at.elapsed() >= FETCH_REFRESH);
         if stale {
-            self.cache = Some(self.fetch(ctx, t_left, t_right, n_pts));
+            let bundle = self.fetch(ctx, t_left, t_right, n_pts);
+            self.cache = Some(bundle);
         }
         let data = self.cache.as_ref().expect("cache populated above");
 
@@ -323,36 +375,22 @@ impl PaneView for DashboardPane {
         let mut fan_pts: Vec<(i64, [f64; 7])> = Vec::new();
         let mut tod = vec![0.0f64; TOD_BINS];
         let mut conf = 0.0f64;
+        let mut bio_hour: Option<f64> = None;
         if let Some(p) = &pred {
-            let base = p.made_at;
-            for (i, &m) in p.line.iter().enumerate() {
-                median_pts.push((base + i as i64 * GRID_MS, m));
-            }
-            for i in 0..p.line.len() {
-                let mut q = [0.0f64; 7];
-                let mut ok = true;
-                for (k, slot) in q.iter_mut().enumerate() {
-                    match p.fan.get(k).and_then(|row| row.get(i)) {
-                        Some(&v) => *slot = v,
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if ok {
-                    fan_pts.push((base + i as i64 * GRID_MS, q));
-                }
-            }
+            median_pts = median_points(p);
+            fan_pts = fan_columns(p);
             // The prediction now carries a nested circadian belief (or `None`
-            // when the model has no time head), not a zeroed 12-vector. Map its
-            // probabilities onto the fixed gauge width and use the resultant
-            // vector length as the confidence.
+            // when the model has no time head), not a zeroed 12-vector. The
+            // phone's own `predicted_hour` — a probability-weighted mean
+            // resultant over the hour circle — drives the dial; the
+            // probabilities are kept only as the argmax fallback, so a model
+            // whose bin count is not the gauge's 12 still reports its hour.
             if let Some(c) = &p.circadian {
-                if c.probs.len() == TOD_BINS {
+                if !c.probs.is_empty() && c.probs.len() == c.n_bins as usize {
                     tod = c.probs.clone();
                 }
                 conf = c.resultant_r;
+                bio_hour = Some(c.predicted_hour);
             }
         }
 
@@ -418,6 +456,7 @@ impl PaneView for DashboardPane {
         FanWidget::new()
             .window(t_left, t_right)
             .y_bounds(lo, hi)
+            .unit(ctx.unit)
             .points(fan_pts)
             .render(chart_region, &mut virt, theme);
         BgChart::new()
@@ -444,6 +483,7 @@ impl PaneView for DashboardPane {
             t_right,
             y_min: lo,
             y_max: hi,
+            unit: BgUnit::Mgdl,
         };
         for &ts in &ticks {
             if let Some(col) = axis_proj.col(axis_plot, ts) {
@@ -516,12 +556,15 @@ impl PaneView for DashboardPane {
         let local_min = (now + tz as i64 * 60_000)
             .div_euclid(60_000)
             .rem_euclid(1440);
-        BioTimeGauge::new()
+        let mut gauge = BioTimeGauge::new()
             .tod(tod)
             .conf(conf)
             .current_bin(current_bin(now, tz))
-            .now_local((local_min / 60) as u8, (local_min % 60) as u8)
-            .render(Rect::new(area.x, y, area.width, bio_h), &mut virt, theme);
+            .now_local((local_min / 60) as u8, (local_min % 60) as u8);
+        if let Some(h) = bio_hour {
+            gauge = gauge.bio_hour(h);
+        }
+        gauge.render(Rect::new(area.x, y, area.width, bio_h), &mut virt, theme);
 
         // --- draw -----------------------------------------------------------
         let buf = frame.buffer_mut();
@@ -676,6 +719,51 @@ impl PaneView for DashboardPane {
             ctx.request_redraw();
         }
     }
+
+    fn invalidate(&mut self) {
+        self.cache = None;
+    }
+}
+
+/// The forecast timestamp of step `i`. Wire contract: `line[i]` and `fan[q][i]`
+/// are the model's forecast for `made_at + (i + 1) * GRID_MS`, so step 0 lands
+/// one grid step AFTER the cycle tick and never on it — `made_at` is the
+/// measured anchor the curve grows out of, and the phone scores its own
+/// accuracy against that same convention.
+fn step_ts(made_at: i64, i: usize) -> i64 {
+    made_at + (i as i64 + 1) * GRID_MS
+}
+
+/// The median line laid onto the grid.
+fn median_points(p: &PredictionEvent) -> Vec<(i64, f64)> {
+    p.line
+        .iter()
+        .enumerate()
+        .map(|(i, &m)| (step_ts(p.made_at, i), m))
+        .collect()
+}
+
+/// The quantile fan transposed to one 7-tuple per step. A step whose fan is
+/// short of a quantile row is dropped whole rather than half-shaded.
+fn fan_columns(p: &PredictionEvent) -> Vec<(i64, [f64; 7])> {
+    let mut out = Vec::with_capacity(p.line.len());
+    for i in 0..p.line.len() {
+        let mut q = [0.0f64; 7];
+        let mut ok = true;
+        for (k, slot) in q.iter_mut().enumerate() {
+            match p.fan.get(k).and_then(|row| row.get(i)) {
+                Some(&v) => *slot = v,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            out.push((step_ts(p.made_at, i), q));
+        }
+    }
+    out
 }
 
 /// The 2-hour circadian bin (0..12) for `now_ms` at timezone `tz` (minutes).
@@ -760,5 +848,59 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(max).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 12:00:00Z, on the 5-minute grid.
+    const MADE_AT: i64 = 1_735_732_800_000;
+
+    fn pred(line: Vec<f64>) -> PredictionEvent {
+        let h = line.len();
+        PredictionEvent {
+            made_at: MADE_AT,
+            model_id: "m".into(),
+            updated_at: MADE_AT,
+            horizon_steps: h as i32,
+            fan: (0..7)
+                .map(|q| (0..h).map(|i| line[i] + q as f64).collect())
+                .collect(),
+            line,
+            circadian: None,
+        }
+    }
+
+    #[test]
+    fn the_forecast_starts_one_bucket_after_the_cycle_tick() {
+        let mut line = vec![120.0; 24];
+        line[23] = 61.0;
+        let p = pred(line);
+        let med = median_points(&p);
+        assert_eq!(med.len(), 24);
+        // Step 0 is +5 min, never the anchor itself.
+        assert_eq!(med[0].0, MADE_AT + GRID_MS);
+        // The 61 mg/dL trough of a 24-step horizon is the 2 h point: 14:00,
+        // which is what the phone reports for the same wire row.
+        assert_eq!(med[23], (MADE_AT + 24 * GRID_MS, 61.0));
+        assert_eq!(med[23].0 - MADE_AT, 2 * 3_600_000);
+
+        // The fan columns must sit on the very same grid as the median.
+        let fan = fan_columns(&p);
+        assert_eq!(fan.len(), 24);
+        for (a, b) in med.iter().zip(fan.iter()) {
+            assert_eq!(a.0, b.0);
+        }
+    }
+
+    #[test]
+    fn a_short_fan_row_drops_that_step_whole() {
+        let mut p = pred(vec![100.0, 110.0, 120.0]);
+        p.fan[4].pop();
+        let fan = fan_columns(&p);
+        assert_eq!(fan.len(), 2);
+        assert_eq!(fan[0].0, MADE_AT + GRID_MS);
     }
 }

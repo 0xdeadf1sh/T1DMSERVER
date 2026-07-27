@@ -213,6 +213,10 @@ impl PaneView for DataPane {
             Action::None
         }
     }
+
+    fn invalidate(&mut self) {
+        self.last_fetch = None;
+    }
 }
 
 /// A right-aligned numeric cell, dimmed to a middle dot when absent.
