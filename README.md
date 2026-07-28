@@ -21,9 +21,13 @@ never re-stamping a client's timestamps.
 
 ## Gallery
 
-![Dashboard — Tron Legacy theme](gallery/dashboard-tron.png)
+![Dashboard with the Tron Legacy theme](gallery/dashboard-tron.png)
 
-![Dashboard — Umbrella Corp theme](gallery/dashboard-umbrella.png)
+*Dashboard with the Tron Legacy theme.*
+
+![Dashboard with the Umbrella Corp theme](gallery/dashboard-umbrella.png)
+
+*Dashboard with the Umbrella Corp theme.*
 
 ## Features
 
