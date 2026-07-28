@@ -19,6 +19,12 @@ never re-stamping a client's timestamps.
 > healthcare professional. Provided "as is", without warranty; the authors accept
 > no liability.
 
+## Gallery
+
+![Dashboard — Tron Legacy theme](gallery/dashboard-tron.png)
+
+![Dashboard — Umbrella Corp theme](gallery/dashboard-umbrella.png)
+
 ## Features
 
 - **Scalar grid.** Blood glucose, heart rate, steps, sleep, exercise, and mood
