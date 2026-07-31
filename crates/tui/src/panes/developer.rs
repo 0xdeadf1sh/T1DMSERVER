@@ -35,7 +35,6 @@ enum Mode {
 pub struct DeveloperPane {
     sel: usize,
     with_predictions: bool,
-    with_notes: bool,
     mode: Mode,
     status: Option<String>,
     /// Background generation job (kept off the render thread so the UI stays
@@ -50,7 +49,6 @@ impl Default for DeveloperPane {
         DeveloperPane {
             sel: 0,
             with_predictions: true,
-            with_notes: true,
             mode: Mode::Menu,
             status: None,
             job: None,
@@ -72,7 +70,6 @@ impl DeveloperPane {
             // A fresh seed per run so repeated generations differ.
             seed: ctx.now_ms as u64 ^ 0x9E37_79B9_7F4A_7C15,
             with_predictions: self.with_predictions,
-            with_notes: self.with_notes,
             ..FakeOpts::default()
         };
         let store = ctx.store.clone();
@@ -112,7 +109,7 @@ impl DeveloperPane {
                 Style::default().fg(pal.dim),
             )),
             Line::from(Span::styled(
-                "prediction fan, and a few notes — written straight into the store.",
+                "prediction fan — written straight into the store.",
                 Style::default().fg(pal.dim),
             )),
             Line::from(""),
@@ -147,15 +144,10 @@ impl DeveloperPane {
                 format!("[{}]", flag(self.with_predictions)),
                 Style::default().fg(pal.secondary),
             ),
-            Span::styled("   notes ", Style::default().fg(pal.dim)),
-            Span::styled(
-                format!("[{}]", flag(self.with_notes)),
-                Style::default().fg(pal.secondary),
-            ),
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "j/k select · Enter generate · p predictions · n notes · X teardown",
+            "j/k select · Enter generate · p predictions · X teardown",
             Style::default().fg(pal.dim),
         )));
         lines.push(Line::from(""));
@@ -317,10 +309,6 @@ impl PaneView for DeveloperPane {
             }
             KeyCode::Char('p') => {
                 self.with_predictions = !self.with_predictions;
-                Action::Redraw
-            }
-            KeyCode::Char('n') => {
-                self.with_notes = !self.with_notes;
                 Action::Redraw
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.generate(ctx),

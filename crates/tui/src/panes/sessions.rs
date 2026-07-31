@@ -21,7 +21,7 @@ use t1dm_core::{QrConfig, QrPayload, Session, Token, TokenKind};
 use crate::theme::Palette;
 use crate::widgets::qr::render_qr;
 
-use super::notes::fmt_dt;
+use super::fmt_dt;
 use super::{Action, Ctx, PaneView};
 
 const REFRESH: Duration = Duration::from_secs(2);

@@ -117,7 +117,6 @@ async fn bridge_events(mut rx: broadcast::Receiver<HubMsg>, tui_tx: broadcast::S
                 let ev = match msg.event {
                     Event::Sample(s) => AppEvent::Sample(s),
                     Event::Prediction(p) => AppEvent::Prediction(p),
-                    Event::Note(n) => AppEvent::Note(n),
                     Event::Photo(p) => AppEvent::Photo(p),
                     Event::Alert(a) => AppEvent::Alert(a),
                     // Meal/Dose/BasalSchedule/Stats carry no footer indicator, but the

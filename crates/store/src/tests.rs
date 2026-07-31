@@ -99,7 +99,6 @@ fn migrations_apply_once_and_are_idempotent() {
         "basal_schedule_dose",
         "prediction",
         "stats_block",
-        "note",
         "photo",
         "alert",
         "token",
@@ -113,6 +112,19 @@ fn migrations_apply_once_and_are_idempotent() {
         assert_eq!(n, 0, "{tbl} should start empty");
     }
 
+    // The note feature is withdrawn: v2 drops the table v1 created, so a fresh
+    // store must not carry it.
+    let notes: i64 = ts
+        .with_reader(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='note'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(notes, 0, "the note table must not survive migration");
+
     // Reopening the same directory re-applies cleanly (idempotent open).
     let dir = ts.dir.clone();
     let reopened = Store::open_at(&dir).unwrap();
@@ -120,6 +132,62 @@ fn migrations_apply_once_and_are_idempotent() {
         .get_samples(&Series::ALL, None, None, None, None)
         .unwrap()
         .is_empty());
+}
+
+/// A store as it stood before the note feature was withdrawn: version 1
+/// recorded, the `note` table present and populated. The store is keep-forever,
+/// so those rows go only if a migration drops them — this pins that it does.
+#[test]
+fn migration_drops_the_note_table_of_a_v1_store() {
+    let dir = std::env::temp_dir().join(format!(
+        "t1dm-v1-store-{}-{}",
+        std::process::id(),
+        crate::now_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("t1dm.db")).unwrap();
+    conn.execute_batch(crate::schema::CONNECTION_PRAGMAS).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations (
+             version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+         INSERT INTO schema_migrations(version, applied_at) VALUES (1, 0);
+         CREATE TABLE note (
+             id INTEGER PRIMARY KEY, client_id TEXT NOT NULL,
+             ts INTEGER NOT NULL, tz_offset INTEGER NOT NULL DEFAULT 0,
+             text TEXT NOT NULL, updated_at INTEGER NOT NULL,
+             created_at INTEGER NOT NULL);
+         CREATE UNIQUE INDEX note_client ON note(client_id);
+         INSERT INTO note(client_id, ts, tz_offset, text, updated_at, created_at)
+             VALUES ('n-1', 0, 0, 'felt low before lunch', 1, 1);",
+    )
+    .unwrap();
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM note", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, 1, "the v1 fixture starts with one stored note");
+
+    crate::schema::migrate(&conn).unwrap();
+
+    let head: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(head, LATEST_VERSION);
+    let tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='note'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0, "the note table and its rows must be dropped");
+
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ------------------------------------------------------------- one_rw tokens
@@ -174,8 +242,8 @@ fn ingest_bundle_roundtrips_coalesces_and_rejects_off_grid() {
     let t = grid_ts(0);
 
     // Six demoted scalars only — carbs/bolus/basal are first-class curve events
-    // now, and predictions/notes have their own endpoints. `updated_at` is the
-    // phone clock, stored verbatim.
+    // now, and predictions have their own endpoint. `updated_at` is the phone
+    // clock, stored verbatim.
     let bundle = IngestBundle {
         ts: t,
         tz_offset: -300,

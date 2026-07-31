@@ -16,7 +16,7 @@ use t1dm_core::Model;
 use crate::widgets::ScrollState;
 
 use super::help::{scroll_key, scroll_mouse};
-use super::notes::fmt_dt;
+use super::fmt_dt;
 use super::{Action, Ctx, PaneView};
 
 const REFRESH: Duration = Duration::from_secs(2);

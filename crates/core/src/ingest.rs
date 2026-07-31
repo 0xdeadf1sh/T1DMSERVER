@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// Atomic 5-minute bundle accepted by `POST /v1/ingest`. Carries the demoted
 /// scalar series only — carbs/bolus/basal are now first-class curve events
-/// (`meal_event`/`dose_event`) and predictions/notes have their own endpoints.
+/// (`meal_event`/`dose_event`) and predictions have their own endpoint.
 /// Every physiologic field is optional; an absent field leaves the stored
 /// column untouched (COALESCE upsert keyed on `ts`). `updated_at` is the phone
 /// clock, stored verbatim (never re-stamped by the server).

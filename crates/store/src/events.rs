@@ -17,7 +17,7 @@
 //! a `SELECT … WHERE client_id = ?` (never `last_insert_rowid()`, which is 0 on a
 //! no-op) so the api layer can fan it out with `broadcast_except(origin)`.
 //!
-//! The prediction / stats-block / note / alert writers and readers live in their
+//! The prediction / stats-block / alert writers and readers live in their
 //! §5-designated files (`writes.rs`, `reads.rs`, `stats.rs`) and are intentionally
 //! NOT duplicated here.
 

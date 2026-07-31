@@ -3,7 +3,7 @@
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 
-use t1dm_core::{Alert, IngestBundle, Note, Photo, PredictionWrite};
+use t1dm_core::{Alert, IngestBundle, Photo, PredictionWrite};
 
 use crate::error::{Result, StoreError};
 use crate::{now_ms, Store};
@@ -33,8 +33,8 @@ WHERE excluded.updated_at >= samples.updated_at
 
 impl Store {
     /// Ingest one atomic 5-minute bundle: a single demoted-scalar sample row.
-    /// Carbs/bolus/basal are first-class curve events and predictions/notes have
-    /// their own endpoints, so a bundle is now one guarded upsert (no embedded
+    /// Carbs/bolus/basal are first-class curve events and predictions have their
+    /// own endpoint, so a bundle is now one guarded upsert (no embedded
     /// records, no enclosing transaction needed). `updated_at` is stored verbatim
     /// (the phone clock, never re-stamped); `received_at` is the server's
     /// internal arrival stamp and never crosses the wire.
@@ -76,54 +76,6 @@ impl Store {
             }
             tx.commit()?;
             Ok(ids)
-        })
-    }
-
-    /// Upsert a free-text note, idempotent on the phone's `client_id`. A newer
-    /// `updated_at` replaces the row in place (a phone-side edit); a stale or
-    /// equal redelivery is a no-op. `updated_at` is stored verbatim; `created_at`
-    /// is the server's internal stamp, minted once and preserved across edits.
-    pub fn add_note(
-        &self,
-        client_id: &str,
-        ts: i64,
-        tz_offset: i32,
-        text: &str,
-        updated_at: i64,
-    ) -> Result<Note> {
-        let now = now_ms();
-        self.with_writer(|conn| {
-            conn.execute(
-                "INSERT INTO note(client_id, ts, tz_offset, text, updated_at, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6)
-                 ON CONFLICT(client_id) DO UPDATE SET
-                    ts         = excluded.ts,
-                    tz_offset  = excluded.tz_offset,
-                    text       = excluded.text,
-                    updated_at = excluded.updated_at
-                 WHERE excluded.updated_at > note.updated_at",
-                params![client_id, ts, tz_offset, text, updated_at, now],
-            )?;
-            // The guarded upsert may no-op; return the canonical stored row (its
-            // id and possibly-older values), never last_insert_rowid() (0 on a
-            // no-op).
-            let note = conn.query_row(
-                "SELECT id, client_id, ts, tz_offset, text, updated_at, created_at
-                 FROM note WHERE client_id = ?1",
-                params![client_id],
-                |r| {
-                    Ok(Note {
-                        id: r.get(0)?,
-                        client_id: r.get(1)?,
-                        ts: r.get(2)?,
-                        tz_offset: r.get(3)?,
-                        text: r.get(4)?,
-                        updated_at: r.get(5)?,
-                        created_at: r.get(6)?,
-                    })
-                },
-            )?;
-            Ok(note)
         })
     }
 

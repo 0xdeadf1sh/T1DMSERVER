@@ -1,8 +1,8 @@
 //! Synthetic dataset generation for the Developer pane — a plausible BG
 //! trace (diurnal sine + meal excursions + noise, clamped 40–400) over the
 //! demoted scalar series (bg/hr/steps/sleep/exercise/mood), plus a widening
-//! prediction fan with a synthetic circadian head and a few notes. Carbs and
-//! insulin are now first-class curve events, generated elsewhere, not here.
+//! prediction fan with a synthetic circadian head. Carbs and insulin are now
+//! first-class curve events, generated elsewhere, not here.
 
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
@@ -35,7 +35,6 @@ impl FakeRange {
 pub struct FakeOpts {
     pub seed: u64,
     pub with_predictions: bool,
-    pub with_notes: bool,
     /// Forecast horizon in grid steps for generated predictions.
     pub horizon_steps: i32,
 }
@@ -45,7 +44,6 @@ impl Default for FakeOpts {
         FakeOpts {
             seed: 0x7431_446D_5345_4544,
             with_predictions: true,
-            with_notes: true,
             horizon_steps: 24,
         }
     }
@@ -100,10 +98,6 @@ impl Store {
                 last_pred_ts = ts;
             }
 
-            if opts.with_notes && rng.random_bool(0.01) {
-                let client_id = format!("fake-note-{ts}");
-                let _ = self.add_note(&client_id, ts, 0, sample_note(&mut rng), now);
-            }
 
             ts += t1dm_core::GRID_MS;
         }
@@ -198,13 +192,3 @@ fn synth_circadian(rng: &mut SmallRng) -> Circadian {
     }
 }
 
-fn sample_note(rng: &mut SmallRng) -> &'static str {
-    const NOTES: [&str; 5] = [
-        "felt low before lunch",
-        "long walk after dinner",
-        "stressful meeting",
-        "corrected a spike",
-        "new sensor applied",
-    ];
-    NOTES[rng.random_range(0..NOTES.len())]
-}

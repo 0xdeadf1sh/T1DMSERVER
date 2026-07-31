@@ -58,7 +58,6 @@ pub fn build_router(store: Store, hub: WsHub) -> Router {
             put(handlers::put_predictions).get(handlers::get_predictions),
         )
         .route("/predictions/latest", get(handlers::get_prediction_latest))
-        .route("/notes", post(handlers::post_note).get(handlers::get_notes))
         .route(
             "/photos",
             post(handlers::post_photo).get(handlers::get_photos),

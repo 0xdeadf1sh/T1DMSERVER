@@ -836,56 +836,29 @@ async fn predictions_roundtrip_and_fanout() {
 }
 
 #[tokio::test]
-async fn notes_fanout_and_client_id() {
+async fn notes_routes_are_gone() {
     let ts = temp_store();
-    let (rw, rw_secret) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
-    let (ro, _ro_secret) = ts
-        .store
-        .mint_token(TokenKind::Ro, Some("watcher".into()))
-        .unwrap();
+    let (_rw, rw_secret) = ts.store.mint_token(TokenKind::Rw, None).unwrap();
 
-    let hub = WsHub::new(64);
-    let mut sub = hub.subscribe();
-
+    // The note feature is withdrawn from the suite: the paths are unrouted, so
+    // an authenticated caller gets 404 — not the 405 a registered path answers
+    // for a method it does not serve, and not a 200.
     let body = json!({
         "client_id": "note-1", "ts": grid_ts(2), "tz_offset": 0,
         "text": "felt low after run", "updated_at": phone_clock(2)
     })
     .to_string();
-    let resp = app_on(&ts.store, &hub)
+    let resp = app(ts.store.clone())
         .oneshot(body_req("POST", "/v1/notes", &rw_secret, &body))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp).await;
-    assert_eq!(v["id"], json!("note-1"));
-
-    let msg = sub.recv().await.expect("hub message");
-    assert_eq!(msg.exclude_token, Some(rw.id));
-    assert!(!msg.delivers_to(rw.id));
-    assert!(msg.delivers_to(ro.id));
-    match msg.event {
-        Event::Note(n) => {
-            assert_eq!(n.client_id, "note-1");
-            assert_eq!(n.text, "felt low after run");
-            assert_eq!(n.updated_at, phone_clock(2));
-        }
-        other => panic!("expected Note event, got {other:?}"),
-    }
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let resp = app(ts.store.clone())
-        .oneshot(get_req(
-            &format!("/v1/notes?from={}&to={}", grid_ts(0), grid_ts(10)),
-            &rw_secret,
-        ))
+        .oneshot(get_req("/v1/notes", &rw_secret))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp).await;
-    let notes = v["notes"].as_array().expect("notes array");
-    assert_eq!(notes.len(), 1);
-    assert_eq!(notes[0]["client_id"], json!("note-1"));
-    assert_eq!(notes[0]["updated_at"], json!(phone_clock(2)));
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1184,13 +1157,14 @@ async fn oversized_body_is_payload_too_large_in_the_error_envelope() {
 
     // A body comfortably over axum's own 2 MiB default is accepted.
     let filler = "y".repeat(3 * 1024 * 1024);
-    let body = json!({
-        "client_id": "note-big", "ts": grid_ts(0), "tz_offset": 0,
-        "text": filler, "updated_at": phone_clock(0)
-    })
+    let body = json!([{
+        "client_id": "meal-big", "ts": grid_ts(0), "tz_offset": 0,
+        "updated_at": phone_clock(0), "grams": 40.0, "duration_min": 180.0,
+        "note": filler
+    }])
     .to_string();
     let resp = app(ts.store.clone())
-        .oneshot(body_req("POST", "/v1/notes", &rw, &body))
+        .oneshot(body_req("PUT", "/v1/meals", &rw, &body))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

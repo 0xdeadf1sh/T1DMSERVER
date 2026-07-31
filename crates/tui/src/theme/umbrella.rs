@@ -38,7 +38,6 @@ impl Default for Umbrella {
             },
             glyphs: Glyphs {
                 live_point: '⬢',
-                note_marker: '▲',
                 photo_marker: '▦',
                 spark: ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'],
             },

@@ -3,7 +3,7 @@
 
 use rusqlite::{params, OptionalExtension, Row};
 
-use t1dm_core::{Alert, Circadian, Note, Photo, PredictionEvent, SampleRow, Series};
+use t1dm_core::{Alert, Circadian, Photo, PredictionEvent, SampleRow, Series};
 
 use crate::error::Result;
 use crate::Store;
@@ -27,20 +27,6 @@ fn map_sample(row: &Row<'_>) -> rusqlite::Result<SampleRow> {
         mood: row.get(7)?,
         updated_at: row.get(8)?,
         received_at: row.get(9)?,
-    })
-}
-
-const NOTE_COLS: &str = "id, client_id, ts, tz_offset, text, updated_at, created_at";
-
-fn map_note(row: &Row<'_>) -> rusqlite::Result<Note> {
-    Ok(Note {
-        id: row.get(0)?,
-        client_id: row.get(1)?,
-        ts: row.get(2)?,
-        tz_offset: row.get(3)?,
-        text: row.get(4)?,
-        updated_at: row.get(5)?,
-        created_at: row.get(6)?,
     })
 }
 
@@ -154,22 +140,6 @@ impl Store {
             );
             let out = conn.query_row(&sql, [], map_prediction).optional()?;
             Ok(out)
-        })
-    }
-
-    /// Notes with `ts` in `[from, to]`, newest first.
-    pub fn get_notes(&self, from: Option<i64>, to: Option<i64>) -> Result<Vec<Note>> {
-        let lo = from.unwrap_or(i64::MIN);
-        let hi = to.unwrap_or(i64::MAX);
-        self.with_reader(|conn| {
-            let sql = format!(
-                "SELECT {NOTE_COLS} FROM note WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts DESC"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(params![lo, hi], map_note)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
         })
     }
 

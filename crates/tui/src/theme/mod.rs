@@ -100,7 +100,6 @@ pub enum TransitionStyle {
 #[derive(Debug, Clone, Copy)]
 pub struct Glyphs {
     pub live_point: char,
-    pub note_marker: char,
     pub photo_marker: char,
     pub spark: [char; 8],
 }
@@ -109,7 +108,6 @@ impl Default for Glyphs {
     fn default() -> Self {
         Glyphs {
             live_point: '●',
-            note_marker: '◆',
             photo_marker: '▣',
             spark: ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'],
         }

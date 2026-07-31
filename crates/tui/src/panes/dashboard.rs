@@ -1,5 +1,5 @@
 //! Dashboard pane — the default view. A tall braille BG chart (actual line
-//! past + future) with the shaded quantile fan and note/photo markers sits at
+//! past + future) with the shaded quantile fan and photo markers sits at
 //! the top; the taller time-aligned insulin/carbs/HR strips and a circadian
 //! bio-time gauge are stacked beneath it and revealed by scrolling down. All
 //! data is pulled live through the [`Ctx`] store handle each frame.
@@ -76,7 +76,6 @@ struct FetchCache {
     tz: i32,
     channels: ReconstructedChannels,
     pred: Option<PredictionEvent>,
-    notes: Vec<i64>,
     photos: Vec<i64>,
 }
 
@@ -221,13 +220,6 @@ impl DashboardPane {
             .reconstruct_channels(t_left, t_right)
             .unwrap_or_default();
         let pred = ctx.store.get_prediction_latest().ok().flatten();
-        let notes: Vec<i64> = ctx
-            .store
-            .get_notes(Some(t_left), Some(t_right))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|n| n.ts)
-            .collect();
         let photos: Vec<i64> = ctx
             .store
             .get_photos(Some(t_left), Some(t_right))
@@ -244,7 +236,6 @@ impl DashboardPane {
             tz,
             channels,
             pred,
-            notes,
             photos,
         }
     }
@@ -339,7 +330,7 @@ impl PaneView for DashboardPane {
 
         // --- fetch (throttled) ---------------------------------------------
         // The BG/HR series, the reconstructed insulin/carb channels, the latest
-        // forecast, and the note/photo markers are pulled here in one shot and
+        // forecast, and the photo markers are pulled here in one shot and
         // cached. A moved window (pan/zoom/resize or the 5-minute `now` tick)
         // refetches at once; otherwise the bundle is reused until it ages past
         // FETCH_REFRESH, so the pulse/heartbeat animation re-renders from the
@@ -368,7 +359,6 @@ impl PaneView for DashboardPane {
         let hr_bpm = data.hr_bpm;
         let tz = data.tz;
         let pred = data.pred.clone();
-        let notes: Vec<i64> = data.notes.clone();
         let photos: Vec<i64> = data.photos.clone();
         self.hr_bpm = hr_bpm;
         let mut median_pts: Vec<(i64, f64)> = Vec::new();
@@ -412,7 +402,7 @@ impl PaneView for DashboardPane {
             lo = (hi - 40.0).max(40.0);
         }
 
-        // Note/photo marker timestamps come from the cached bundle above.
+        // Photo marker timestamps come from the cached bundle above.
 
         // --- stacked virtual layout ----------------------------------------
         // The BG chart occupies the top and takes its natural (large) size; the
@@ -467,7 +457,6 @@ impl PaneView for DashboardPane {
             .pulse(self.pulse)
             .bg(bg_pts)
             .median(median_pts)
-            .notes(notes)
             .photos(photos)
             .ticks(ticks.clone())
             .hr(hr_bpm)

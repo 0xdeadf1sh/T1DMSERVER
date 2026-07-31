@@ -57,16 +57,6 @@ pub struct WsQuery {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct NoteBody {
-    pub client_id: String,
-    pub ts: i64,
-    #[serde(default)]
-    pub tz_offset: i32,
-    pub text: String,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct AlertBody {
     pub client_id: String,
     pub ts: i64,
@@ -230,27 +220,6 @@ pub async fn put_stats(
     Ok(Json(json!({ "ok": true, "window": window.as_str() })))
 }
 
-pub async fn post_note(
-    State(app): State<AppState>,
-    auth: RwAuth,
-    JsonBody(body): JsonBody<NoteBody>,
-) -> ApiResult<Json<Value>> {
-    let origin = auth.0.token.id;
-    let store = app.store.clone();
-    let note = blocking(move || {
-        store.add_note(
-            &body.client_id,
-            body.ts,
-            body.tz_offset,
-            &body.text,
-            body.updated_at,
-        )
-    })
-    .await?;
-    app.hub.broadcast_except(Event::Note(note.clone()), origin);
-    Ok(Json(json!({ "ok": true, "id": note.client_id })))
-}
-
 /// A body that overran the router's limit must answer 413, not 400: the photo
 /// upload is not queued, so a caller that reads it as a permanent client error
 /// discards the image instead of retrying it smaller.
@@ -387,16 +356,6 @@ pub async fn get_prediction_latest(
     let store = app.store.clone();
     let pred = blocking(move || store.get_prediction_latest()).await?;
     Ok(Json(json!({ "prediction": pred })))
-}
-
-pub async fn get_notes(
-    State(app): State<AppState>,
-    _auth: Auth,
-    Query(q): Query<RangeQuery>,
-) -> ApiResult<Json<Value>> {
-    let store = app.store.clone();
-    let notes = blocking(move || store.get_notes(q.from, q.to)).await?;
-    Ok(Json(json!({ "notes": notes })))
 }
 
 pub async fn get_alerts(

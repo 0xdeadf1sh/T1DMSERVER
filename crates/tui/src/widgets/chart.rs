@@ -1,6 +1,6 @@
 //! Custom braille BG chart: the actual glucose line (past + future) drawn on
 //! a 2×4 braille sub-cell canvas, threshold reference lines, a "now" divider,
-//! a pulsing live point, and note/photo markers along the baseline. The
+//! a pulsing live point, and photo markers along the baseline. The
 //! prediction fan is a sibling widget ([`super::fan`]) that shades the same
 //! plot rect *before* this widget lays the median line on top.
 //!
@@ -220,7 +220,6 @@ pub struct BgChart {
     pulse: f32,
     bg: Vec<(i64, f64)>,
     median: Vec<(i64, f64)>,
-    notes: Vec<i64>,
     photos: Vec<i64>,
     /// Timestamps of the vertical gridlines / time-axis ticks (epoch ms).
     ticks: Vec<i64>,
@@ -269,11 +268,6 @@ impl BgChart {
 
     pub fn median(mut self, median: Vec<(i64, f64)>) -> Self {
         self.median = median;
-        self
-    }
-
-    pub fn notes(mut self, notes: Vec<i64>) -> Self {
-        self.notes = notes;
         self
     }
 
@@ -556,14 +550,6 @@ impl BgChart {
         glyphs: &crate::theme::Glyphs,
     ) {
         let row = plot.bottom().saturating_sub(1);
-        for &ts in &self.notes {
-            if let Some(col) = proj.col(plot, ts) {
-                if let Some(cell) = buf.cell_mut((col, row)) {
-                    cell.set_char(glyphs.note_marker);
-                    cell.fg = pal.secondary;
-                }
-            }
-        }
         for &ts in &self.photos {
             if let Some(col) = proj.col(plot, ts) {
                 if let Some(cell) = buf.cell_mut((col, row)) {

@@ -50,7 +50,7 @@ const SESSION_LIVE_MS: i64 = 10 * 60 * 1000;
 /// of back-to-back wake-ups; invalidating on each would clear the panes' fetch
 /// caches faster than their own throttles can refill them, defeating those
 /// throttles during exactly the burst they exist for. The debounce keeps a
-/// leading edge — an isolated meal or note still repaints on the next frame —
+/// leading edge — an isolated meal or dose still repaints on the next frame —
 /// and folds the remainder of a burst into one trailing refetch.
 const INVALIDATE_COALESCE: Duration = Duration::from_millis(250);
 
@@ -378,8 +378,8 @@ impl App {
 
     /// Apply a data event pushed from the server side. Every kind that mutates
     /// a record a pane serves out of a throttled cache — samples, predictions,
-    /// notes, photos, and the aggregate [`AppEvent::StoreChanged`] — drops that
-    /// cache. Alerts are the exception: they reach the footer directly and no
+    /// photos, and the aggregate [`AppEvent::StoreChanged`] — drops that cache.
+    /// Alerts are the exception: they reach the footer directly and no
     /// pane reads them back from the store.
     pub fn apply_event(&mut self, ev: AppEvent) {
         self.connected = true;
@@ -393,10 +393,9 @@ impl App {
                 self.footer.tz_offset_min = row.tz_offset;
                 self.note_store_change();
             }
-            AppEvent::Prediction(_)
-            | AppEvent::Note(_)
-            | AppEvent::Photo(_)
-            | AppEvent::StoreChanged => self.note_store_change(),
+            AppEvent::Prediction(_) | AppEvent::Photo(_) | AppEvent::StoreChanged => {
+                self.note_store_change()
+            }
         }
     }
 
@@ -638,7 +637,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    use t1dm_core::{Alert, Note, Photo, PredictionEvent, SampleRow};
+    use t1dm_core::{Alert, Photo, PredictionEvent, SampleRow};
 
     /// A store rooted in a fresh temp dir, wiped on drop.
     struct TempStore {
@@ -688,7 +687,7 @@ mod tests {
         let (mut app, _ts) = test_app(0);
         // A pane that neither animates nor requests redraws, in a layout with
         // no gutter animation, so `tick` reports only the pending invalidation.
-        app.current = Pane::Notes;
+        app.current = Pane::Models;
         app.last_area = Rect::new(0, 0, 80, 24);
 
         // Leading edge: the first write of a burst repaints at once.
@@ -730,7 +729,6 @@ mod tests {
             &mut app,
             AppEvent::Prediction(PredictionEvent::default())
         ));
-        assert!(invalidates(&mut app, AppEvent::Note(Note::default())));
         assert!(invalidates(&mut app, AppEvent::Photo(Photo::default())));
         assert!(invalidates(&mut app, AppEvent::StoreChanged));
         // Alerts reach the footer directly; no pane reads them back.

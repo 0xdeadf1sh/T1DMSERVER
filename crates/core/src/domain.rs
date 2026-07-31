@@ -150,20 +150,6 @@ pub struct PredictionEvent {
     pub circadian: Option<Circadian>,
 }
 
-/// A free-text note pinned to a grid timestamp, keyed by the phone's
-/// `client_id`. `updated_at` is the phone clock, stored verbatim; a phone-side
-/// edit carries a newer `updated_at`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct Note {
-    pub id: i64,
-    pub client_id: String,
-    pub ts: i64,
-    pub tz_offset: i32,
-    pub text: String,
-    pub updated_at: i64,
-    pub created_at: i64,
-}
-
 /// A meal photo. The binary lives under `<data_dir>/photos/`; only metadata
 /// is stored in the DB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

@@ -103,7 +103,7 @@ impl PaneView for HelpPane {
         lines.push(head("Developer"));
         lines.push(key("j / k", "choose a synthetic range"));
         lines.push(key("Enter", "generate synthetic data"));
-        lines.push(key("p / n", "toggle predictions / notes"));
+        lines.push(key("p", "toggle predictions"));
         lines.push(key("X", "teardown store (type WIPE to confirm)"));
         lines.push(blank());
 

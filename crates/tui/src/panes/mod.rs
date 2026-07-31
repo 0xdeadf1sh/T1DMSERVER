@@ -9,7 +9,6 @@ pub mod device;
 pub mod help;
 pub mod logs;
 pub mod models;
-pub mod notes;
 pub mod sessions;
 pub mod settings;
 
@@ -31,7 +30,6 @@ pub enum Pane {
     Dashboard,
     Data,
     Models,
-    Notes,
     Sessions,
     Device,
     Developer,
@@ -43,11 +41,10 @@ pub enum Pane {
 impl Pane {
     /// Panes in header order. `Help` is an overlay and is intentionally last;
     /// it is not part of the Tab cycle set returned by [`Pane::cycle`].
-    pub const HEADER: [Pane; 10] = [
+    pub const HEADER: [Pane; 9] = [
         Pane::Dashboard,
         Pane::Data,
         Pane::Models,
-        Pane::Notes,
         Pane::Sessions,
         Pane::Device,
         Pane::Developer,
@@ -57,11 +54,10 @@ impl Pane {
     ];
 
     /// The Tab-cycle set (everything except the Help overlay).
-    pub const CYCLE: [Pane; 9] = [
+    pub const CYCLE: [Pane; 8] = [
         Pane::Dashboard,
         Pane::Data,
         Pane::Models,
-        Pane::Notes,
         Pane::Sessions,
         Pane::Device,
         Pane::Developer,
@@ -74,7 +70,6 @@ impl Pane {
             Pane::Dashboard => "Dashboard",
             Pane::Data => "Data",
             Pane::Models => "Models",
-            Pane::Notes => "Notes",
             Pane::Sessions => "Sessions",
             Pane::Device => "Device",
             Pane::Developer => "Developer",
@@ -180,13 +175,31 @@ pub trait PaneView {
     fn invalidate(&mut self) {}
 }
 
+/// Format an epoch-ms instant, applying a tz offset in minutes east of UTC, as
+/// `YYYY-MM-DD HH:MM`.
+pub(crate) fn fmt_dt(ms: i64, tz_off_min: i32) -> String {
+    use time::{OffsetDateTime, UtcOffset};
+    let secs = ms.div_euclid(1000);
+    let mut dt = OffsetDateTime::from_unix_timestamp(secs).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    if let Ok(off) = UtcOffset::from_whole_seconds(tz_off_min * 60) {
+        dt = dt.to_offset(off);
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute()
+    )
+}
+
 /// Construct the boxed pane implementation for a [`Pane`].
 pub fn make_pane(pane: Pane) -> Box<dyn PaneView> {
     match pane {
         Pane::Dashboard => Box::new(dashboard::DashboardPane::default()),
         Pane::Data => Box::new(data::DataPane::default()),
         Pane::Models => Box::new(models::ModelsPane::default()),
-        Pane::Notes => Box::new(notes::NotesPane::default()),
         Pane::Sessions => Box::new(sessions::SessionsPane::default()),
         Pane::Device => Box::new(device::DevicePane::default()),
         Pane::Developer => Box::new(developer::DeveloperPane::default()),

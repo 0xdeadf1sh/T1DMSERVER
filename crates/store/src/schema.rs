@@ -1,5 +1,5 @@
-//! Schema DDL and the migration runner. The whole schema is one migration
-//! for now.
+//! Schema DDL and the migration runner. Version 1 is the whole schema; each
+//! later migration is an incremental step applied on top of it.
 
 use rusqlite::Connection;
 
@@ -177,11 +177,19 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 "#;
 
+/// Version 2: the note feature is withdrawn from the suite, so the table and
+/// its indexes go. Version 1 is left as written — it is what the stores in the
+/// field actually applied — and this step drops the table on top of it, which
+/// is also what a fresh store does, in the same order.
+const MIGRATION_V2: &str = r#"
+DROP TABLE IF EXISTS note;
+"#;
+
 /// The highest migration version defined by this schema.
-pub const LATEST_VERSION: i64 = 1;
+pub const LATEST_VERSION: i64 = 2;
 
 /// All migrations in ascending version order.
-const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_V1)];
+const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2)];
 
 /// Run all outstanding migrations against `conn`. Idempotent. Afterwards the
 /// recorded head must have reached [`LATEST_VERSION`] — a bumped constant with
@@ -236,7 +244,6 @@ DROP TABLE IF EXISTS dose_event;
 DROP TABLE IF EXISTS basal_schedule_dose;
 DROP TABLE IF EXISTS prediction;
 DROP TABLE IF EXISTS stats_block;
-DROP TABLE IF EXISTS note;
 DROP TABLE IF EXISTS photo;
 DROP TABLE IF EXISTS alert;
 DROP TABLE IF EXISTS session;

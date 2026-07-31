@@ -41,7 +41,6 @@ impl Default for HelloKitty {
             },
             glyphs: Glyphs {
                 live_point: '❀',
-                note_marker: '♥',
                 photo_marker: '❁',
                 spark: ['⠁', '⠃', '⠇', '⠏', '⠟', '⠿', '⡿', '⣿'],
             },

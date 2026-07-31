@@ -25,7 +25,7 @@ use ratatui::crossterm::execute;
 use tokio::sync::broadcast;
 
 use store::Store;
-use t1dm_core::{Alert, Config, Note, Photo, PredictionEvent, SampleRow};
+use t1dm_core::{Alert, Config, Photo, PredictionEvent, SampleRow};
 
 use crate::app::App;
 use crate::boot::BootSequence;
@@ -60,7 +60,6 @@ pub type ClientProbe = Arc<dyn Fn() -> usize + Send + Sync>;
 pub enum AppEvent {
     Sample(SampleRow),
     Prediction(PredictionEvent),
-    Note(Note),
     Photo(Photo),
     Alert(Alert),
     /// A store write that carries no footer indicator of its own (meal, dose,
