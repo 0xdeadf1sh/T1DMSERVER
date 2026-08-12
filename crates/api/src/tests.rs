@@ -1360,3 +1360,26 @@ async fn model_of_any_extension_is_listed_and_downloadable() {
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body.as_ref(), weights);
 }
+
+/// Every `Event` variant must survive `serde_json::to_string`. The enum is internally tagged, which
+/// cannot represent a variant serialising as a sequence — and the WS send loop discards a
+/// serialisation error silently, so a variant that cannot encode is a fan-out that never fires and
+/// never complains. Compile-time typing does not catch it; only round-tripping does.
+#[test]
+fn every_hub_event_variant_serializes() {
+    use t1dm_core::CgmSourceRow;
+    let events = vec![Event::CgmSource {
+        sources: vec![CgmSourceRow {
+            id: "s_0f1e2d3c".into(),
+            family: Some("examplevendor".into()),
+            model: None,
+            serial: None,
+            updated_at: 1,
+            received_at: 2,
+        }],
+    }];
+    for ev in events {
+        let json = serde_json::to_string(&ev).expect("every Event variant must serialize");
+        assert!(json.contains("\"type\""), "internally tagged: {json}");
+    }
+}

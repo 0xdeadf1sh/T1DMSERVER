@@ -174,7 +174,8 @@ pub async fn put_cgm_sources(
     let store = app.store.clone();
     let stored = sources.clone();
     let ids = blocking(move || store.put_cgm_sources(&sources)).await?;
-    app.hub.broadcast_except(Event::CgmSource(stored), origin);
+    app.hub
+        .broadcast_except(Event::CgmSource { sources: stored }, origin);
     Ok(Json(json!({ "ok": true, "ids": ids })))
 }
 

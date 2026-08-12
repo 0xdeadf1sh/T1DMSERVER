@@ -21,8 +21,12 @@ pub enum Event {
     Dose(DoseEvent),
     #[serde(rename = "basal_schedule")]
     BasalSchedule(BasalSchedule),
+    /// A struct variant, not `CgmSource(Vec<CgmSourceRow>)`. [`Event`] is internally tagged, and
+    /// serde cannot inject the `"type"` key into a value that serialises as a sequence — a newtype
+    /// variant wrapping a `Vec` fails at RUNTIME with "cannot serialize tagged newtype variant",
+    /// which the WS send loop discards silently. Naming the field gives the tag a map to live in.
     #[serde(rename = "cgm_source")]
-    CgmSource(Vec<CgmSourceRow>),
+    CgmSource { sources: Vec<CgmSourceRow> },
     Stats(StatsBlock),
 }
 

@@ -125,7 +125,7 @@ async fn bridge_events(mut rx: broadcast::Receiver<HubMsg>, tui_tx: broadcast::S
                     Event::Meal(_)
                     | Event::Dose(_)
                     | Event::BasalSchedule(_)
-                    | Event::CgmSource(_)
+                    | Event::CgmSource { .. }
                     | Event::Stats(_) => AppEvent::StoreChanged,
                 };
                 let _ = tui_tx.send(ev);
