@@ -83,6 +83,9 @@ impl Store {
                 tz_offset: 0,
                 updated_at: now,
                 bg: Some(bg),
+                // One synthetic sensor for the whole generated run — the console's
+                // sensor-change marker should not fire on demo data.
+                bg_source: Some("s_demo".to_string()),
                 hr: Some(hr),
                 steps: Some(steps),
                 sleep: Some(if tod < 0.30 { 1.0 } else { 0.0 }),

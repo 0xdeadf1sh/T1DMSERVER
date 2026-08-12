@@ -16,6 +16,10 @@ pub struct IngestBundle {
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg: Option<f64>,
+    /// Which CGM sensor `bg` came from (contract 0.4.0). Opaque — stored and
+    /// compared, never parsed. Absent from a client that does not send one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hr: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

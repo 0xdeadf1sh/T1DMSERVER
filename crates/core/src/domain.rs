@@ -95,6 +95,12 @@ pub struct SampleRow {
     pub ts: i64,
     pub tz_offset: i32,
     pub bg: Option<f64>,
+    /// Which CGM sensor `bg` came from (`SPEC/http-api.md`, contract 0.4.0). A
+    /// LABEL, not a key: `ts` is still the primary key and a slot still holds one
+    /// `bg`. Opaque — compared, never parsed. `None` for every row written before
+    /// the client sent one, which is not the same as "one sensor".
+    #[serde(default)]
+    pub bg_source: Option<String>,
     pub hr: Option<f64>,
     pub steps: Option<f64>,
     pub sleep: Option<f64>,
@@ -311,4 +317,27 @@ impl Default for Model {
             discovered_at: 0,
         }
     }
+}
+
+/// One CGM sensor a `SampleRow.bg_source` may refer to (`SPEC/http-api.md`,
+/// contract 0.4.0). Descriptive and standalone: nothing keys off it, and a
+/// `bg_source` naming a source that was never sent is stored regardless.
+///
+/// `id` is opaque and stable per sensor. `serial` is the number printed on the
+/// sensor when a client chooses to send it — a real device identifier, so it
+/// reaches storage, backups and the console, and a client that omits it loses
+/// only the console's ability to name the physical sensor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CgmSourceRow {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(skip)]
+    pub received_at: i64,
 }

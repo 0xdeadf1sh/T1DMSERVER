@@ -152,6 +152,14 @@ fn migration_drops_the_note_table_of_a_v1_store() {
         "CREATE TABLE schema_migrations (
              version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
          INSERT INTO schema_migrations(version, applied_at) VALUES (1, 0);
+         -- A real v1 store has every table MIGRATION_V1 creates. Only `note` matters
+         -- to this test, but `samples` has to be here too: from v3 the chain alters
+         -- it, and a fixture missing it would fail for a reason that has nothing to
+         -- do with what is being asserted.
+         CREATE TABLE samples (
+             ts INTEGER PRIMARY KEY, tz_offset INTEGER NOT NULL DEFAULT 0,
+             bg REAL, hr REAL, steps REAL, sleep REAL, exercise REAL,
+             mood INTEGER, updated_at INTEGER NOT NULL, received_at INTEGER NOT NULL);
          CREATE TABLE note (
              id INTEGER PRIMARY KEY, client_id TEXT NOT NULL,
              ts INTEGER NOT NULL, tz_offset INTEGER NOT NULL DEFAULT 0,

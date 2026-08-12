@@ -13,7 +13,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use t1dm_core::{
+use t1dm_core::{CgmSourceRow, 
     BasalSchedule, DoseEvent, IngestBundle, MealEvent, PredictionWrite, Series, Stats, StatsBlock,
     StatsWindow,
 };
@@ -159,6 +159,31 @@ pub async fn put_basal_schedule(
     app.hub
         .broadcast_except(Event::BasalSchedule(stored), origin);
     Ok(Json(json!({ "ok": true, "ids": ids })))
+}
+
+/// Store CGM source descriptors (contract 0.4.0). Accepts a source the server has
+/// never heard of and never validates one against a stored `bg_source`: the two
+/// arrive on independent queues, so a check here would fail an ingest on the order
+/// two drains interleaved.
+pub async fn put_cgm_sources(
+    State(app): State<AppState>,
+    auth: RwAuth,
+    JsonBody(sources): JsonBody<Vec<CgmSourceRow>>,
+) -> ApiResult<Json<Value>> {
+    let origin = auth.0.token.id;
+    let store = app.store.clone();
+    let stored = sources.clone();
+    let ids = blocking(move || store.put_cgm_sources(&sources)).await?;
+    app.hub.broadcast_except(Event::CgmSource(stored), origin);
+    Ok(Json(json!({ "ok": true, "ids": ids })))
+}
+
+pub async fn get_cgm_sources(
+    State(app): State<AppState>,
+    _auth: Auth,
+) -> ApiResult<Json<Vec<CgmSourceRow>>> {
+    let store = app.store.clone();
+    Ok(Json(blocking(move || store.get_cgm_sources()).await?))
 }
 
 pub async fn put_predictions(

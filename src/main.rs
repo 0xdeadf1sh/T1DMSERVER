@@ -122,9 +122,11 @@ async fn bridge_events(mut rx: broadcast::Receiver<HubMsg>, tui_tx: broadcast::S
                     // Meal/Dose/BasalSchedule/Stats carry no footer indicator, but the
                     // panes reconstruct them from the store behind a throttle — and a
                     // non-animating layout draws no frame unless something asks for one.
-                    Event::Meal(_) | Event::Dose(_) | Event::BasalSchedule(_) | Event::Stats(_) => {
-                        AppEvent::StoreChanged
-                    }
+                    Event::Meal(_)
+                    | Event::Dose(_)
+                    | Event::BasalSchedule(_)
+                    | Event::CgmSource(_)
+                    | Event::Stats(_) => AppEvent::StoreChanged,
                 };
                 let _ = tui_tx.send(ev);
             }

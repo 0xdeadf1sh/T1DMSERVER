@@ -3,7 +3,7 @@
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 
-use t1dm_core::{Alert, IngestBundle, Photo, PredictionWrite};
+use t1dm_core::{Alert, CgmSourceRow, IngestBundle, Photo, PredictionWrite};
 
 use crate::error::{Result, StoreError};
 use crate::{now_ms, Store};
@@ -16,11 +16,16 @@ use crate::{now_ms, Store};
 /// makes a stale redelivery a no-op while still admitting multiple partial fills
 /// that share one bucket-tick's `updated_at` (`>=`, not `>`).
 const INGEST_UPSERT: &str = r#"
-INSERT INTO samples (ts, tz_offset, bg, hr, steps, sleep, exercise, mood, updated_at, received_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+INSERT INTO samples (ts, tz_offset, bg, bg_source, hr, steps, sleep, exercise, mood, updated_at, received_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
 ON CONFLICT(ts) DO UPDATE SET
     tz_offset   = excluded.tz_offset,
     bg          = COALESCE(excluded.bg, samples.bg),
+    -- Moves with `bg` and only with it. A partial fill carrying steps but no bg
+    -- must not relabel the reading already stored, and a bg that IS being written
+    -- must not keep the previous sensor's label — which is what a plain COALESCE
+    -- on bg_source alone would do the first time an unlabelled client wrote.
+    bg_source   = CASE WHEN excluded.bg IS NULL THEN samples.bg_source ELSE excluded.bg_source END,
     hr          = COALESCE(excluded.hr, samples.hr),
     steps       = COALESCE(excluded.steps, samples.steps),
     sleep       = COALESCE(excluded.sleep, samples.sleep),
@@ -50,6 +55,7 @@ impl Store {
                     bundle.ts,
                     bundle.tz_offset,
                     bundle.bg,
+                    bundle.bg_source,
                     bundle.hr,
                     bundle.steps,
                     bundle.sleep,
@@ -335,4 +341,45 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     to_hex(&hasher.finalize())
+}
+
+/// Upsert one CGM source descriptor, idempotent on `id`.
+///
+/// Unconditional, unlike the sample upsert's `updated_at` guard: this row is a
+/// description of a physical object rather than a reading, the client is its only
+/// author, and the newest description it sends is the one to keep.
+const CGM_SOURCE_UPSERT: &str = r#"
+INSERT INTO cgm_source (id, family, model, serial, updated_at, received_at)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+ON CONFLICT(id) DO UPDATE SET
+    family      = excluded.family,
+    model       = excluded.model,
+    serial      = excluded.serial,
+    updated_at  = excluded.updated_at,
+    received_at = excluded.received_at
+"#;
+
+impl Store {
+    /// Store CGM source descriptors verbatim. Returns the ids written.
+    pub fn put_cgm_sources(&self, sources: &[CgmSourceRow]) -> Result<Vec<String>> {
+        let received_at = now_ms();
+        self.with_writer(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            for s in sources {
+                tx.execute(
+                    CGM_SOURCE_UPSERT,
+                    params![
+                        s.id,
+                        s.family,
+                        s.model,
+                        s.serial,
+                        s.updated_at, // (#2) phone clock, VERBATIM
+                        received_at,  // (#2) server clock, INTERNAL only
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(sources.iter().map(|s| s.id.clone()).collect())
+        })
+    }
 }

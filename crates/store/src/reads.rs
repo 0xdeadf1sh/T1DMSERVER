@@ -3,7 +3,7 @@
 
 use rusqlite::{params, OptionalExtension, Row};
 
-use t1dm_core::{Alert, Circadian, Photo, PredictionEvent, SampleRow, Series};
+use t1dm_core::{Alert, CgmSourceRow, Circadian, Photo, PredictionEvent, SampleRow, Series};
 
 use crate::error::Result;
 use crate::Store;
@@ -12,21 +12,22 @@ use crate::Store;
 // internal server clock and is NOT served (skipped on the wire in the
 // `SampleRow` serde definition, §2.3) — it is read here only to populate the
 // struct's internal field.
-const SAMPLE_COLS: &str =
-    "ts, tz_offset, bg, hr, steps, sleep, exercise, mood, updated_at, received_at";
+const SAMPLE_COLS: &str = "ts, tz_offset, bg, bg_source, hr, steps, sleep, exercise, mood, \
+     updated_at, received_at";
 
 fn map_sample(row: &Row<'_>) -> rusqlite::Result<SampleRow> {
     Ok(SampleRow {
         ts: row.get(0)?,
         tz_offset: row.get(1)?,
         bg: row.get(2)?,
-        hr: row.get(3)?,
-        steps: row.get(4)?,
-        sleep: row.get(5)?,
-        exercise: row.get(6)?,
-        mood: row.get(7)?,
-        updated_at: row.get(8)?,
-        received_at: row.get(9)?,
+        bg_source: row.get(3)?,
+        hr: row.get(4)?,
+        steps: row.get(5)?,
+        sleep: row.get(6)?,
+        exercise: row.get(7)?,
+        mood: row.get(8)?,
+        updated_at: row.get(9)?,
+        received_at: row.get(10)?,
     })
 }
 
@@ -202,6 +203,31 @@ impl Store {
                     |r| r.get(0),
                 )
                 .optional()?)
+        })
+    }
+}
+
+impl Store {
+    /// Every CGM source on record, oldest description first.
+    pub fn get_cgm_sources(&self) -> Result<Vec<CgmSourceRow>> {
+        self.with_reader(|conn| {
+            let mut st = conn.prepare(
+                "SELECT id, family, model, serial, updated_at, received_at \
+                 FROM cgm_source ORDER BY updated_at, id",
+            )?;
+            let rows = st
+                .query_map([], |r| {
+                    Ok(CgmSourceRow {
+                        id: r.get(0)?,
+                        family: r.get(1)?,
+                        model: r.get(2)?,
+                        serial: r.get(3)?,
+                        updated_at: r.get(4)?,
+                        received_at: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
         })
     }
 }

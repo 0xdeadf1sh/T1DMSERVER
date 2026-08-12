@@ -5,7 +5,7 @@
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use t1dm_core::{
+use t1dm_core::{CgmSourceRow, 
     Alert, BasalSchedule, DoseEvent, MealEvent, Photo, PredictionEvent, SampleRow, StatsBlock,
 };
 
@@ -21,6 +21,8 @@ pub enum Event {
     Dose(DoseEvent),
     #[serde(rename = "basal_schedule")]
     BasalSchedule(BasalSchedule),
+    #[serde(rename = "cgm_source")]
+    CgmSource(Vec<CgmSourceRow>),
     Stats(StatsBlock),
 }
 

@@ -54,6 +54,10 @@ pub fn build_router(store: Store, hub: WsHub) -> Router {
             put(handlers::put_basal_schedule).get(handlers::get_basal_schedule),
         )
         .route(
+            "/cgm-sources",
+            put(handlers::put_cgm_sources).get(handlers::get_cgm_sources),
+        )
+        .route(
             "/predictions",
             put(handlers::put_predictions).get(handlers::get_predictions),
         )

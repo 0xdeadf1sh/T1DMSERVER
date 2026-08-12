@@ -19,8 +19,8 @@ pub use config::{
     BackupConfig, Config, LogConfig, QrConfig, ServerConfig, StorageConfig, UiConfig,
 };
 pub use domain::{
-    Alert, Model, Photo, PredictionEvent, SampleRow, Series, Session, StatsBlock, Token, TokenKind,
-    QUANTILE_LEVELS, TOD_BINS,
+    Alert, CgmSourceRow, Model, Photo, PredictionEvent, SampleRow, Series, Session, StatsBlock,
+    Token, TokenKind, QUANTILE_LEVELS, TOD_BINS,
 };
 pub use error::{CoreError, Result};
 pub use events::{

@@ -185,11 +185,38 @@ const MIGRATION_V2: &str = r#"
 DROP TABLE IF EXISTS note;
 "#;
 
+/// Version 3 (contract 0.4.0): a sample records WHICH CGM sensor its `bg` came
+/// from, and the sensors themselves get a table.
+///
+/// `bg_source` is a label, not a key — `ts` stays the primary key and a slot
+/// still holds one `bg`, because the phone sends only the sensor it trusts. It
+/// is nullable and defaults to NULL: every row written before this migration
+/// genuinely has no record of which sensor produced it, and inventing one would
+/// be indistinguishable from having been told.
+///
+/// `cgm_source` is descriptive and stands alone. There is no foreign key to it
+/// on purpose: `bg_source` and the source rows arrive on independent queues, so
+/// a constraint would make an ingest fail on the order two drains happened to
+/// interleave — dropping a reading to protect a description of it.
+const MIGRATION_V3: &str = r#"
+ALTER TABLE samples ADD COLUMN bg_source TEXT;
+
+CREATE TABLE IF NOT EXISTS cgm_source (
+    id          TEXT PRIMARY KEY,          -- opaque, stable per sensor; compared, never parsed
+    family      TEXT,
+    model       TEXT,
+    serial      TEXT,
+    updated_at  INTEGER NOT NULL,          -- (#2) CLIENT clock, VERBATIM
+    received_at INTEGER NOT NULL           -- (#2) SERVER clock, INTERNAL only
+);
+"#;
+
 /// The highest migration version defined by this schema.
-pub const LATEST_VERSION: i64 = 2;
+pub const LATEST_VERSION: i64 = 3;
 
 /// All migrations in ascending version order.
-const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2)];
+const MIGRATIONS: &[(i64, &str)] =
+    &[(1, MIGRATION_V1), (2, MIGRATION_V2), (3, MIGRATION_V3)];
 
 /// Run all outstanding migrations against `conn`. Idempotent. Afterwards the
 /// recorded head must have reached [`LATEST_VERSION`] — a bumped constant with
@@ -250,5 +277,6 @@ DROP TABLE IF EXISTS session;
 DROP TABLE IF EXISTS token;
 DROP TABLE IF EXISTS model;
 DROP TABLE IF EXISTS meta;
+DROP TABLE IF EXISTS cgm_source;
 DROP TABLE IF EXISTS schema_migrations;
 "#;
